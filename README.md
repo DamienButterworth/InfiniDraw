@@ -1,4 +1,4 @@
-# Infinite Zoom Studio
+# InfiniDraw
 
 An infinite-zoom drawing canvas that lives in a single HTML file. Draw anything, then zoom into any corner of your drawing forever — each level of zoom becomes fresh, full-resolution canvas to keep drawing on. There is no bottom and no edge.
 
