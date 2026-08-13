@@ -897,8 +897,12 @@ function saveLocal(){
 function scheduleSave(){ clearTimeout(saveTimer); saveTimer=setTimeout(saveLocal,1000); }
 function restoreLocal(){ let text; try{ text=localStorage.getItem(SAVE_KEY); }catch(e){ return; }
   if(!text) return; let o; try{ o=JSON.parse(text); }catch(e){ return; } if(!o||!o.root) return; loadState(o); }
-addEventListener("visibilitychange",()=>{ if(document.visibilityState==="hidden") saveLocal(); });   // flush before the tab is backgrounded/closed
+addEventListener("visibilitychange",()=>{
+  if(document.visibilityState==="hidden"){ saveLocal(); return; }   // flush before the tab is backgrounded/closed
+  resize(); dirty=true;                                             // returning to the tab: mobile purges the canvas backing store while backgrounded, so force a full repaint instead of showing blank until refresh
+});
 addEventListener("pagehide",saveLocal);
+addEventListener("pageshow",e=>{ if(e.persisted){ resize(); dirty=true; } });   // bfcache restore keeps JS state but not the canvas pixels; just repaint
 document.getElementById("exportBtn").onclick=exportDrawing;
 document.getElementById("importBtn").onclick=()=>{ jsonFile.value=""; jsonFile.click(); };
 jsonFile.addEventListener("change",()=>{ const f=jsonFile.files&&jsonFile.files[0]; if(!f)return; const r=new FileReader();
