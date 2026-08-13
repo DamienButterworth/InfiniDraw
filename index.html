@@ -83,6 +83,10 @@
   <button class="btn" id="zoomIn" title="Zoom in (+)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/><path d="M11 8v6"/><path d="M8 11h6"/></svg></button>
 
   <span class="sep"></span>
+  <button class="btn" id="zoomOuter" title="Fly to outermost drawing"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="M21 3l-7 7"/><path d="M3 21l7-7"/></svg></button>
+  <button class="btn" id="zoomInner" title="Fly to innermost drawing"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14h6v6"/><path d="M20 10h-6V4"/><path d="M14 10l7-7"/><path d="M3 21l7-7"/></svg></button>
+
+  <span class="sep"></span>
   <div class="swatches" id="swatches">
     <button class="sw active" style="background:#23252b" data-color="#23252b" title="Ink"></button>
     <button class="sw" style="background:#e5484d" data-color="#e5484d"></button>
@@ -144,9 +148,10 @@ let pendingImage=null, placeAnchor=null, previewRect=null;
 let selected=null, dragLast=null, resizeInfo=null, transformSnap=null;
 let dirty=true;
 
+let anim=null;   // active fly-to (outer/inner navigation); see frameToNode/stepAnim
 let targetScale=1, anchorSX=0, anchorSY=0;
 let pVel={x:0,y:0}, mvVel={x:0,y:0}, mvLast=null;
-const ZTAU=0.09, PTAU=0.30;
+const ZTAU=0.09, PTAU=0.30, FLY_EFOLDS_PER_SEC=5.5;   // fly-to speed: zoom-levels crossed per second, so a long jump isn't crammed into a fixed time
 let lastT=performance.now();
 const history=[], future=[];
 
@@ -239,7 +244,10 @@ function itemScreenRect(it,cam){                                            // p
   return {x:rx,y:ry,w:rr-rx,h:rb-ry};
 }
 function drawItems(node,cam){
+  const drawCap=(W+H)*12;                                                  // safety cap: astronomically large geometry (transient during a fly-to between distant depths) would hang the GPU/compositor
   for(const it of node.items){
+    const ib=itemBounds(it);
+    if(Math.max(ib.x1-ib.x0,ib.y1-ib.y0)*cam.scale>drawCap) continue;      // too big to rasterize safely — LOD background fill already covers screen-wide coverage
     if(!it.erases||!it.erases.length){                                     // fast path: no mask, draw straight to main ctx
       g=ctx; ctx.globalAlpha=it.alpha!=null?it.alpha:1; drawOneItem(it,cam); continue;
     }
@@ -386,10 +394,10 @@ function reframe(){
       let best=null;
       for(const c of current.children){ if(Math.abs(camX-c.x)<=c.k/2&&Math.abs(camY-c.y)<=c.k/2){ const on=c.k*camScale; if(on>=VIEW&&(!best||on>best.on)) best={c,on}; } }
       if(best){ descendInto(best.c); continue; }
-      if(camScale>=VIEW/CHILD_K){ descendInto(addChild(current,camX,camY,CHILD_K)); continue; }
+      if(camScale>=VIEW/CHILD_K && !anim){ descendInto(addChild(current,camX,camY,CHILD_K)); continue; }
     }
     if(current.up){ if(camScale<=VIEW*current.up.k){ ascend(); continue; } }
-    else if(camScale<=VIEW*CHILD_K){ const parent=makeNode(),child={x:0,y:0,k:CHILD_K,node:current,parent}; current.up=child; parent.children.push(child); root=parent; markDirty(parent); ascend(); continue; }
+    else if(camScale<=VIEW*CHILD_K && !anim){ const parent=makeNode(),child={x:0,y:0,k:CHILD_K,node:current,parent}; current.up=child; parent.children.push(child); root=parent; markDirty(parent); ascend(); continue; }
     break;
   }
 }
@@ -405,12 +413,55 @@ function physics(dt){
   if(Math.abs(pVel.x)>2||Math.abs(pVel.y)>2){ camX-=pVel.x*dt/camScale; camY-=pVel.y*dt/camScale; const d=Math.exp(-dt/PTAU); pVel.x*=d; pVel.y*=d; dirty=true; }
   else { pVel.x=pVel.y=0; }
 }
-function loop(){ const now=performance.now(); const dt=Math.min(0.05,(now-lastT)/1000)||0.016; lastT=now; physics(dt); if(dirty){ draw(); dirty=false; } requestAnimationFrame(loop); }
+function loop(){ const now=performance.now(); const dt=Math.min(0.05,(now-lastT)/1000)||0.016; lastT=now; if(anim) stepAnim(now); else physics(dt); if(dirty){ draw(); dirty=false; } requestAnimationFrame(loop); }
 
 /* ---------------- zoom ---------------- */
 function wheelZoom(px,py,mult){ anchorSX=px; anchorSY=py; targetScale=Math.max(camScale*1e-3,Math.min(camScale*1e3,targetScale*mult)); }
 function zoomCenter(f){ anchorSX=W/2; anchorSY=H/2; targetScale*=f; }
-function zoomAction(f){ if(tool==="loupe") adjustLoupe(f); else zoomCenter(f); }   // + / - controls lens mag when the loupe is active
+function zoomAction(f){ anim=null; if(tool==="loupe") adjustLoupe(f); else zoomCenter(f); }   // + / - controls lens mag when the loupe is active
+
+/* ---------------- fly-to outer / inner drawing ----------------
+   Content lives at many nesting depths; a node's depth is captured by K, the product of
+   child `k` factors from root down to it (root=1, deeper = smaller). We frame the
+   shallowest node with its own drawing (outer) or the deepest (inner), then animate the
+   camera there. All interpolation happens in the TARGET node's local frame, which is
+   invariant to rebasing: each frame we load the eased camera into that frame and let
+   reframe() re-normalise for rendering, so numbers stay sane at any depth. */
+function nodeToRoot(node){ let ox=0,oy=0,K=1,n=node; while(n.up){ const c=n.up; ox=c.x+ox*c.k; oy=c.y+oy*c.k; K*=c.k; n=c.parent; } return {ox,oy,K}; }
+function ownBBox(node){ let b=null; for(const it of node.items){ const r=itemBounds(it);
+  if(!b) b={x0:r.x0,y0:r.y0,x1:r.x1,y1:r.y1};
+  else{ if(r.x0<b.x0)b.x0=r.x0; if(r.y0<b.y0)b.y0=r.y0; if(r.x1>b.x1)b.x1=r.x1; if(r.y1>b.y1)b.y1=r.y1; } }
+  return b; }
+function nodesWithItems(){ const out=[]; (function rec(n,K){ if(n.items.length) out.push({node:n,K}); for(const c of n.children) rec(c.node,K*c.k); })(root,1); return out; }
+const easeInOut=t=>t<0.5?4*t*t*t:1-Math.pow(-2*t+2,3)/2;
+function frameToNode(target){
+  const bbox=ownBBox(target); if(!bbox) return;
+  const bw=Math.max(1e-9,bbox.x1-bbox.x0), bh=Math.max(1e-9,bbox.y1-bbox.y0);
+  const s1=Math.min(W/bw,H/bh)*0.82, cx1=(bbox.x0+bbox.x1)/2, cy1=(bbox.y0+bbox.y1)/2;   // frame it into ~82% of the viewport
+  const cur=nodeToRoot(current), tgt=nodeToRoot(target), s=cur.K/tgt.K;                   // current camera, re-expressed in target-local
+  const cx0=(cur.ox-tgt.ox)/tgt.K+camX*s, cy0=(cur.oy-tgt.oy)/tgt.K+camY*s, s0=camScale/s;
+  const ls0=Math.log(s0), ls1=Math.log(s1);
+  const ax=s1>=s0?cx1:cx0, ay=s1>=s0?cy1:cy0;         // anchor on the more zoomed-in endpoint (the "small" point): destination for a fly-in, start for a fly-out
+  const p0x=(ax-cx0)*s0+W/2, p0y=(ay-cy0)*s0+H/2;     // where the anchor sits on screen at the start...
+  const p1x=(ax-cx1)*s1+W/2, p1y=(ay-cy1)*s1+H/2;     // ...and at the destination; we ease between while zooming around it
+  const dur=Math.max(380,Math.min(2600, Math.abs(ls1-ls0)/FLY_EFOLDS_PER_SEC*1000));   // constant zoom rate: duration scales with log-distance travelled
+  anim={node:target,ax,ay,p0x,p0y,p1x,p1y,ls0,ls1,t0:performance.now(),dur};
+  dirty=true;
+}
+function zoomToExtreme(outer){
+  const list=nodesWithItems(); if(!list.length){ hintFlash("Nothing to zoom to yet"); return; }
+  let best=list[0]; for(const e of list){ if(outer?e.K>best.K:e.K<best.K) best=e; }
+  pVel.x=pVel.y=0; frameToNode(best.node);
+}
+function stepAnim(now){
+  const u=Math.min(1,(now-anim.t0)/anim.dur), e=easeInOut(u);
+  const scale=Math.exp(anim.ls0+(anim.ls1-anim.ls0)*e);
+  const px=anim.p0x+(anim.p1x-anim.p0x)*e, py=anim.p0y+(anim.p1y-anim.p0y)*e;   // ease the anchor's screen position along its endpoints
+  current=anim.node; camScale=scale; targetScale=scale;
+  camX=anim.ax-(px-W/2)/scale; camY=anim.ay-(py-H/2)/scale;           // zoom anchored on the "small" endpoint keeps it framed both ways
+  if(u>=1) anim=null;   // clear before reframe() so its normal rebasing (node creation) resumes on the final frame
+  reframe(); dirty=true;
+}
 
 /* ---------------- history ---------------- */
 function pushHist(op){ history.push(op); future.length=0; updateHist(); }
@@ -613,7 +664,7 @@ jsonFile.addEventListener("change",()=>{ const f=jsonFile.files&&jsonFile.files[
   r.readAsArrayBuffer(f); });
 
 /* ---------------- pointer handling ---------------- */
-function stopMomentum(){ targetScale=camScale; pVel.x=pVel.y=0; }
+function stopMomentum(){ anim=null; targetScale=camScale; pVel.x=pVel.y=0; }
 canvas.addEventListener("pointerdown",e=>{
   lastPointerType=e.pointerType||"mouse";
   canvas.setPointerCapture(e.pointerId); const p=local(e); pointers.set(e.pointerId,p); cursor=p; stopMomentum();
@@ -663,7 +714,7 @@ function release(e){
 canvas.addEventListener("pointerup",release);
 canvas.addEventListener("pointercancel",release);
 canvas.addEventListener("pointerleave",e=>{ if(!pointers.has(e.pointerId)){ cursor=null; dirty=true; } });
-canvas.addEventListener("wheel",e=>{ e.preventDefault(); const p=local(e); cursor=p;
+canvas.addEventListener("wheel",e=>{ e.preventDefault(); anim=null; const p=local(e); cursor=p;
   if(tool==="loupe"){ adjustLoupe(Math.exp(-e.deltaY*0.003)); return; }   // scroll adjusts the lens, not the canvas
   wheelZoom(p.x,p.y,Math.exp(-e.deltaY*(e.ctrlKey?0.012:0.0016))); },{passive:false});
 canvas.addEventListener("contextmenu",e=>e.preventDefault());
@@ -707,6 +758,8 @@ document.getElementById("undo").onclick=undo;
 document.getElementById("redo").onclick=redo;
 document.getElementById("zoomIn").onclick=()=>zoomAction(1.3);
 document.getElementById("zoomOut").onclick=()=>zoomAction(1/1.3);
+document.getElementById("zoomOuter").onclick=()=>zoomToExtreme(true);
+document.getElementById("zoomInner").onclick=()=>zoomToExtreme(false);
 document.getElementById("clear").onclick=()=>{ if(confirm("Start a new canvas? This clears everything.")){ root=makeNode(); current=root; camX=camY=0; camScale=VIEW; targetScale=VIEW; pVel={x:0,y:0}; selected=null; history.length=0; future.length=0; updateHist(); dirty=true; } };
 bar.addEventListener("pointerdown",e=>e.stopPropagation());
 showTools.addEventListener("pointerdown",e=>e.stopPropagation());
