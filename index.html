@@ -33,6 +33,9 @@
   .sw.active{box-shadow:0 0 0 2px var(--bar),0 0 0 4px #fff;transform:scale(1.12)}
   .sw-custom{position:relative;overflow:hidden}
   .sw-custom input{position:absolute;inset:-6px;width:200%;height:200%;cursor:pointer;opacity:0}
+  .bgpick{position:relative;overflow:hidden}
+  .bgpick input{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer}
+  .bgpick .dot{width:16px;height:16px;border-radius:4px;border:1.5px solid rgba(255,255,255,.35);box-shadow:inset 0 0 0 1px rgba(0,0,0,.15)}
   .sw-custom .ring{position:absolute;inset:0;border-radius:50%;background:conic-gradient(#f43f5e,#f59e0b,#eab308,#22c55e,#06b6d4,#6366f1,#d946ef,#f43f5e)}
   .slider{display:inline-flex;align-items:center;gap:7px;padding:0 5px}
   .slider label{color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.4px}
@@ -90,6 +93,9 @@
   </div>
 
   <span class="sep"></span>
+  <label class="btn bgpick" id="bgWrap" title="Canvas color"><span class="dot" id="bgDot" style="background:#f7f6f2"></span><input type="color" id="bgColorPick" value="#f7f6f2"></label>
+
+  <span class="sep"></span>
   <div class="slider sz"><label>size</label><input type="range" id="size" min="1" max="60" value="4"></div>
   <div class="slider op"><label>opacity</label><input type="range" id="opacity" min="5" max="100" value="100"></div>
 
@@ -128,6 +134,7 @@ let W=0,H=0,VIEW=1,dpr=1;
 
 /* ---------------- tools ---------------- */
 let tool="pen", color="#23252b", size=4, opacity=1;
+let bgColor=null;   // canvas background colour; null = default CSS paper gradient
 
 /* ---------------- input / physics ---------------- */
 const pointers=new Map();
@@ -332,7 +339,7 @@ function drawLoupe(){
   }
   ctx.save();
   ctx.beginPath(); ctx.arc(cx,cy,R,0,6.2832);
-  ctx.fillStyle="#f7f6f2"; ctx.fill();       // opaque paper so the lens reads as its own surface
+  ctx.fillStyle=bgColor||"#f7f6f2"; ctx.fill();   // opaque paper (matches canvas colour) so the lens reads as its own surface
   ctx.clip();
   ctx.translate(cx-W/2,cy-H/2);              // map the inspected point to the lens centre
   renderScene({x:wx,y:wy,scale:camScale*loupeMag});
@@ -472,19 +479,21 @@ function eraserTouches(it,ex,ey,R){                                         // d
     else { const dx=ex-p[i].x,dy=ey-p[i].y; if(dx*dx+dy*dy<=w*w) return true; } }
   return false;
 }
-/* The eraser must reach whichever node actually holds the content under the cursor:
-   after a deep zoom the app rebases so drawn content lives in an ancestor of `current`.
-   This yields every visible node along the cursor — current, ancestors and descendants —
-   with the eraser point and width converted into that node's local coordinates. */
+/* The eraser erases everything under the brush, not just the current frame. After a
+   deep zoom the app rebases so content lives in an ancestor, and the LOD fill keeps it
+   visible from far above the render window — so we climb the whole chain to the top,
+   then DFS back down through EVERY frame the brush overlaps (ancestors, current,
+   descendants and siblings), with the brush converted into each frame's coordinates. */
+const ERASE_UP_CAP=48;                                                     // reach as far up as the LOD fill can show content
 function eraseNodes(pt){
-  const out=[{node:current,ex:wX(pt.x),ey:wY(pt.y),R:eraseWorldW()/2,w:eraseWorldW()}];
-  let a=out[0], node=current;                                              // walk up into ancestors (up-context)
-  for(let i=0;i<UP_LEVELS && node.up;i++){ const up=node.up; a={node:up.parent,ex:up.x+a.ex*up.k,ey:up.y+a.ey*up.k,R:a.R*up.k,w:a.w*up.k}; node=up.parent; out.push(a); }
-  let d=out[0], scale=camScale;                                            // walk down into the descendant under the cursor
-  for(let depth=0;depth<MAX_DEPTH;depth++){ let hit=null;
-    for(const c of d.node.children){ if(Math.abs(d.ex-c.x)<=c.k/2&&Math.abs(d.ey-c.y)<=c.k/2&&c.k*scale>=0.18){ hit=c; break; } }
-    if(!hit) break; scale*=hit.k;
-    d={node:hit.node,ex:(d.ex-hit.x)/hit.k,ey:(d.ey-hit.y)/hit.k,R:d.R/hit.k,w:d.w/hit.k}; out.push(d);
+  let ex=wX(pt.x),ey=wY(pt.y),R=eraseWorldW()/2,w=eraseWorldW(),node=current,scale=camScale;
+  for(let i=0;i<ERASE_UP_CAP && node.up;i++){ const up=node.up; ex=up.x+ex*up.k; ey=up.y+ey*up.k; R*=up.k; w*=up.k; scale/=up.k; node=up.parent; }
+  const out=[], stack=[{node,ex,ey,R,w,scale}];
+  while(stack.length){ const d=stack.pop(); out.push(d);
+    for(const c of d.node.children){ const h=c.k/2;                        // brush disk (d.ex,d.ey,d.R) vs child frame box
+      const qx=Math.max(Math.abs(d.ex-c.x)-h,0), qy=Math.max(Math.abs(d.ey-c.y)-h,0);
+      if(qx*qx+qy*qy<=d.R*d.R){ const cs=d.scale*c.k; if(cs>=0.18)
+        stack.push({node:c.node,ex:(d.ex-c.x)/c.k,ey:(d.ey-c.y)/c.k,R:d.R/c.k,w:d.w/c.k,scale:cs}); } }
   }
   return out;
 }
@@ -575,7 +584,7 @@ function serNode(n){ return {items:n.items.map(serItem), children:n.children.map
 function download(name,blob){ const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download=name; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1500); }
 function pathToCurrent(){ const p=[]; let n=current; while(n.up){ const ch=n.up, idx=ch.parent.children.indexOf(ch); p.push(idx); n=ch.parent; } return p.reverse(); }
 async function exportDrawing(){
-  const payload={app:"infinite-zoom-studio",version:3,view:{path:pathToCurrent(),camX,camY,sc:camScale/VIEW},root:serNode(root)};
+  const payload={app:"infinite-zoom-studio",version:3,bg:bgColor,view:{path:pathToCurrent(),camX,camY,sc:camScale/VIEW},root:serNode(root)};
   const data=JSON.stringify(payload);
   try{ if(window.CompressionStream){ const stream=new Blob([data]).stream().pipeThrough(new CompressionStream("gzip"));
     const blob=await new Response(stream).blob(); download("infinite-zoom-drawing.json.gz",blob); return; } }catch(e){}
@@ -590,6 +599,7 @@ function importDrawing(text){ let o; try{ o=JSON.parse(text); }catch(e){ hintFla
   let cur=root, ok=true; const v=o.view||{};                       // restore camera + which frame you were in
   for(const idx of (v.path||[])){ if(cur.children&&cur.children[idx]) cur=cur.children[idx].node; else { ok=false; break; } }
   current=ok?cur:root; camX=v.camX||0; camY=v.camY||0; camScale=(v.sc||1)*VIEW; targetScale=camScale;
+  bgColor=o.bg||null; applyBg();                                   // restore saved canvas colour
   markDirty(root); dirty=true; hintFlash("Drawing loaded"); }
 document.getElementById("exportBtn").onclick=exportDrawing;
 document.getElementById("importBtn").onclick=()=>{ jsonFile.value=""; jsonFile.click(); };
@@ -688,6 +698,9 @@ const swatches=document.getElementById("swatches");
 function activateSwatch(el){ swatches.querySelectorAll(".sw").forEach(s=>s.classList.remove("active")); el.classList.add("active"); }
 swatches.querySelectorAll(".sw[data-color]").forEach(sw=>{ sw.onclick=()=>{ color=sw.dataset.color; activateSwatch(sw); if(tool==="eraser")setTool("pen"); }; });
 const cc=document.getElementById("customColor"); cc.oninput=()=>{ color=cc.value; activateSwatch(cc.closest(".sw")); if(tool==="eraser")setTool("pen"); };
+const bgPick=document.getElementById("bgColorPick"), bgDot=document.getElementById("bgDot");
+function applyBg(){ document.body.style.background=bgColor||""; if(bgColor){ bgDot.style.background=bgColor; bgPick.value=bgColor; } dirty=true; }  // erased/empty areas show the page bg through the transparent canvas
+bgPick.oninput=()=>{ bgColor=bgPick.value; applyBg(); };
 document.getElementById("size").oninput=e=>{ size=+e.target.value; dirty=true; };
 document.getElementById("opacity").oninput=e=>{ opacity=+e.target.value/100; dirty=true; };
 document.getElementById("undo").onclick=undo;
