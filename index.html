@@ -73,6 +73,11 @@
   <button class="btn" data-tool="select" title="Select / move / resize (V)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 4 7 16 2-6 6-2z"/></svg></button>
   <button class="btn" data-tool="eraser" title="Eraser (E)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 20h11"/><path d="M15.5 5.5 20 10a2 2 0 0 1 0 2.8L12 20H8l-4-4a2 2 0 0 1 0-2.8l7.7-7.7a2 2 0 0 1 2.8 0z"/></svg></button>
   <button class="btn" data-tool="hand" title="Pan (H / Space / two fingers)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 11V6.5a1.5 1.5 0 0 0-3 0V11m0-1.5V5a1.5 1.5 0 0 0-3 0v6m0-5.5a1.5 1.5 0 0 0-3 0V12m0-3.5a1.5 1.5 0 0 0-3 0V15c0 3.3 2.7 6 6 6a6 6 0 0 0 6-6v-3"/></svg></button>
+  <button class="btn" data-tool="loupe" title="Magnifier — hover to inspect detail (G)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><circle cx="11" cy="11" r="3"/><path d="m21 21-4.3-4.3"/></svg></button>
+
+  <span class="sep"></span>
+  <button class="btn" id="zoomOut" title="Zoom out (−)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/><path d="M8 11h6"/></svg></button>
+  <button class="btn" id="zoomIn" title="Zoom in (+)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/><path d="M11 8v6"/><path d="M8 11h6"/></svg></button>
 
   <span class="sep"></span>
   <div class="swatches" id="swatches">
@@ -217,15 +222,55 @@ function renderNode(node,cam,depth){
     renderNode(child.node,cc,depth+1);
   }
 }
-function draw(){
-  ctx.clearRect(0,0,W,H);
+function renderScene(baseCam){
   // climb up to UP_LEVELS ancestors so surrounding context stays visible through zoom transitions
-  let top=current, cam={x:camX,y:camY,scale:camScale};
+  let top=current, cam={x:baseCam.x,y:baseCam.y,scale:baseCam.scale};
   for(let i=0;i<UP_LEVELS && top.up;i++){ const u=top.up; cam={scale:cam.scale/u.k,x:u.x+cam.x*u.k,y:u.y+cam.y*u.k}; top=u.parent; }
   renderNode(top,cam,0);
+}
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  renderScene({x:camX,y:camY,scale:camScale});
   if(previewRect){ ctx.strokeStyle=ACCENT; ctx.setLineDash([7,5]); ctx.lineWidth=1.5; ctx.strokeRect(previewRect.x,previewRect.y,previewRect.w,previewRect.h); ctx.setLineDash([]); }
   if(tool==="select"&&selected&&current.items.indexOf(selected)>=0) drawSelection();
+  if(tool==="loupe") drawLoupe();
   drawCursorRing();
+}
+let loupeMag=2.5, lastPointerType="mouse"; const LOUPE_MIN=1.2, LOUPE_MAX=80;
+function loupeLabel(){ return (loupeMag>=10?Math.round(loupeMag):loupeMag.toFixed(1))+"×"; }
+function adjustLoupe(f){ loupeMag=Math.max(LOUPE_MIN,Math.min(LOUPE_MAX,loupeMag*f)); if(!cursor) hintFlash("Magnifier "+loupeLabel()); dirty=true; }
+function drawLoupe(){
+  if(!cursor||spaceHeld||mode==="pan"||mode==="pinch"||mode==="move"||mode==="resize") return;
+  const R=Math.min(96,VIEW*0.16), touch=lastPointerType==="touch";
+  const wx=wX(cursor.x), wy=wY(cursor.y);   // the world point being inspected (under finger/cursor)
+  let cx=cursor.x, cy=cursor.y;
+  if(touch){                                 // lift the lens clear of the fingertip
+    const OFF=R+42; cy=cursor.y-OFF;
+    if(cy-R<8) cy=cursor.y+OFF;              // flip below when too close to the top edge
+  }
+  ctx.save();
+  ctx.beginPath(); ctx.arc(cx,cy,R,0,6.2832);
+  ctx.fillStyle="#f7f6f2"; ctx.fill();       // opaque paper so the lens reads as its own surface
+  ctx.clip();
+  ctx.translate(cx-W/2,cy-H/2);              // map the inspected point to the lens centre
+  renderScene({x:wx,y:wy,scale:camScale*loupeMag});
+  ctx.restore();
+  ctx.beginPath(); ctx.arc(cx,cy,R,0,6.2832); ctx.strokeStyle="rgba(20,22,28,.55)"; ctx.lineWidth=3; ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx,cy,R,0,6.2832); ctx.strokeStyle=ACCENT; ctx.lineWidth=1.5; ctx.stroke();
+  if(touch){                                 // mark the real spot under the finger, away from the lens
+    ctx.beginPath(); ctx.arc(cursor.x,cursor.y,7,0,6.2832); ctx.strokeStyle=ACCENT; ctx.lineWidth=2; ctx.stroke();
+    ctx.beginPath(); ctx.arc(cursor.x,cursor.y,1.6,0,6.2832); ctx.fillStyle=ACCENT; ctx.fill();
+  } else {
+    ctx.strokeStyle="rgba(20,22,28,.35)"; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(cx-6,cy); ctx.lineTo(cx+6,cy); ctx.moveTo(cx,cy-6); ctx.lineTo(cx,cy+6); ctx.stroke();
+  }
+  const label=loupeLabel();                  // current magnification, pinned to the bottom of the lens
+  ctx.font="600 12px ui-sans-serif,system-ui,-apple-system,sans-serif"; ctx.textAlign="center"; ctx.textBaseline="middle";
+  const pw=ctx.measureText(label).width+14, ph=19, ly2=cy+R-16;
+  ctx.fillStyle="rgba(20,22,28,.75)"; ctx.beginPath();
+  if(ctx.roundRect) ctx.roundRect(cx-pw/2,ly2-ph/2,pw,ph,9); else ctx.rect(cx-pw/2,ly2-ph/2,pw,ph);
+  ctx.fill(); ctx.fillStyle="#eef0f4"; ctx.fillText(label,cx,ly2+0.5);
+  ctx.textAlign="start"; ctx.textBaseline="alphabetic";
 }
 function drawSelection(){
   const b=itemBounds(selected);
@@ -236,7 +281,7 @@ function drawSelection(){
 }
 function drawCursorRing(){
   if(!cursor||mode==="pan"||mode==="pinch"||mode==="move"||mode==="resize") return;
-  if(tool==="hand"||spaceHeld||tool==="image"||tool==="select") return;
+  if(tool==="hand"||spaceHeld||tool==="image"||tool==="select"||tool==="loupe") return;
   const r=Math.max(2, size*(tool==="marker"?2.2:1)/2);   // on-screen brush is always `size` px
   ctx.beginPath(); ctx.arc(cursor.x,cursor.y,r,0,6.2832); ctx.strokeStyle="rgba(35,37,43,.4)"; ctx.lineWidth=1; ctx.stroke();
 }
@@ -276,6 +321,7 @@ function loop(){ const now=performance.now(); const dt=Math.min(0.05,(now-lastT)
 /* ---------------- zoom ---------------- */
 function wheelZoom(px,py,mult){ anchorSX=px; anchorSY=py; targetScale=Math.max(camScale*1e-3,Math.min(camScale*1e3,targetScale*mult)); }
 function zoomCenter(f){ anchorSX=W/2; anchorSY=H/2; targetScale*=f; }
+function zoomAction(f){ if(tool==="loupe") adjustLoupe(f); else zoomCenter(f); }   // + / - controls lens mag when the loupe is active
 
 /* ---------------- history ---------------- */
 function pushHist(op){ history.push(op); future.length=0; updateHist(); }
@@ -432,6 +478,7 @@ jsonFile.addEventListener("change",()=>{ const f=jsonFile.files&&jsonFile.files[
 /* ---------------- pointer handling ---------------- */
 function stopMomentum(){ targetScale=camScale; pVel.x=pVel.y=0; }
 canvas.addEventListener("pointerdown",e=>{
+  lastPointerType=e.pointerType||"mouse";
   canvas.setPointerCapture(e.pointerId); const p=local(e); pointers.set(e.pointerId,p); cursor=p; stopMomentum();
   mvVel={x:0,y:0}; mvLast={x:p.x,y:p.y,t:performance.now()};
   if(pointers.size===2){ if(draft){applyRemove(current,draft);draft=null;} eraseSnap=null; eraseNode=null; mode="pinch";
@@ -445,6 +492,7 @@ canvas.addEventListener("pointerdown",e=>{
   else if(tool==="image"){ if(pendingImage){ mode="placeimg"; placeAnchor=p; previewRect={x:p.x,y:p.y,w:0,h:0}; } else { fileInput.value=""; fileInput.click(); } }
 });
 canvas.addEventListener("pointermove",e=>{
+  lastPointerType=e.pointerType||"mouse";
   const p=local(e); cursor=p;
   if(mvLast&&pointers.size<2){ const now=performance.now(),dt=Math.max(8,now-mvLast.t)/1000; mvVel.x=mvVel.x*0.6+((p.x-mvLast.x)/dt)*0.4; mvVel.y=mvVel.y*0.6+((p.y-mvLast.y)/dt)*0.4; mvLast={x:p.x,y:p.y,t:now}; }
   if(!pointers.has(e.pointerId)){ dirty=true; return; }
@@ -472,12 +520,15 @@ function release(e){
   else if(mode==="placeimg"){ placeImage(previewRect||{x:cursor.x,y:cursor.y,w:0,h:0}); placeAnchor=null; mode=null; }
   else if(mode==="pinch"){ if(pointers.size===1){ mode="pan"; panLast=[...pointers.values()][0]; mvLast={x:panLast.x,y:panLast.y,t:performance.now()}; } else if(pointers.size===0){ mode=null; pVel={x:mvVel.x,y:mvVel.y}; } }
   else if(mode==="pan"){ if(pointers.size===0){ mode=null; panLast=null; pVel={x:mvVel.x,y:mvVel.y}; } }
+  if(lastPointerType==="touch"&&pointers.size===0) cursor=null;   // no hover on touch — drop the loupe when the finger lifts
   setCursor(); dirty=true;
 }
 canvas.addEventListener("pointerup",release);
 canvas.addEventListener("pointercancel",release);
 canvas.addEventListener("pointerleave",e=>{ if(!pointers.has(e.pointerId)){ cursor=null; dirty=true; } });
-canvas.addEventListener("wheel",e=>{ e.preventDefault(); const p=local(e); wheelZoom(p.x,p.y,Math.exp(-e.deltaY*(e.ctrlKey?0.012:0.0016))); },{passive:false});
+canvas.addEventListener("wheel",e=>{ e.preventDefault(); const p=local(e); cursor=p;
+  if(tool==="loupe"){ adjustLoupe(Math.exp(-e.deltaY*0.003)); return; }   // scroll adjusts the lens, not the canvas
+  wheelZoom(p.x,p.y,Math.exp(-e.deltaY*(e.ctrlKey?0.012:0.0016))); },{passive:false});
 canvas.addEventListener("contextmenu",e=>e.preventDefault());
 
 /* ---------------- keyboard ---------------- */
@@ -490,17 +541,17 @@ addEventListener("keydown",e=>{
   if(mod&&e.key.toLowerCase()==="s"){ e.preventDefault(); exportDrawing(); return; }
   if(e.target&&e.target.tagName==="INPUT") return;
   if((e.key==="Delete"||e.key==="Backspace")&&selected){ e.preventDefault(); deleteSelected(); return; }
-  const k=e.key.toLowerCase(), map={p:"pen",b:"brush",m:"marker",l:"line",r:"rect",o:"ellipse",v:"select",e:"eraser",h:"hand"};
+  const k=e.key.toLowerCase(), map={p:"pen",b:"brush",m:"marker",l:"line",r:"rect",o:"ellipse",v:"select",e:"eraser",h:"hand",g:"loupe"};
   if(k==="i"){ document.getElementById("imgBtn").click(); }
   else if(map[k]) setTool(map[k]);
-  else if(k==="="||k==="+")zoomCenter(1.3); else if(k==="-"||k==="_")zoomCenter(1/1.3);
+  else if(k==="="||k==="+")zoomAction(1.3); else if(k==="-"||k==="_")zoomAction(1/1.3);
 });
 addEventListener("keyup",e=>{ if(e.code==="Space"){ spaceHeld=false; setCursor(); dirty=true; } });
 
 /* ---------------- toolbar ---------------- */
 const bar=document.getElementById("bar"), showTools=document.getElementById("showTools");
 function setTool(t){ tool=t; document.querySelectorAll("[data-tool]").forEach(b=>b.classList.toggle("active",b.dataset.tool===t)); if(t!=="image"){ pendingImage=null; previewRect=null; } if(t!=="select") selected=null; setCursor(); dirty=true; }
-function setCursor(){ canvas.style.cursor=(tool==="hand"||spaceHeld)?(mode==="pan"?"grabbing":"grab"):(tool==="select"?"default":"crosshair"); }
+function setCursor(){ canvas.style.cursor=(tool==="hand"||spaceHeld)?(mode==="pan"?"grabbing":"grab"):(tool==="loupe"?"none":(tool==="select"?"default":"crosshair")); }
 document.querySelectorAll("[data-tool]").forEach(b=>{ if(b.id==="imgBtn") return; b.onclick=()=>setTool(b.dataset.tool); });
 let uiHidden=false;
 function toggleUI(){ uiHidden=!uiHidden; bar.style.display=uiHidden?"none":"flex"; showTools.style.display=uiHidden?"flex":"none"; }
@@ -514,6 +565,8 @@ document.getElementById("size").oninput=e=>{ size=+e.target.value; dirty=true; }
 document.getElementById("opacity").oninput=e=>{ opacity=+e.target.value/100; dirty=true; };
 document.getElementById("undo").onclick=undo;
 document.getElementById("redo").onclick=redo;
+document.getElementById("zoomIn").onclick=()=>zoomAction(1.3);
+document.getElementById("zoomOut").onclick=()=>zoomAction(1/1.3);
 document.getElementById("clear").onclick=()=>{ if(confirm("Start a new canvas? This clears everything.")){ root=makeNode(); current=root; camX=camY=0; camScale=VIEW; targetScale=VIEW; pVel={x:0,y:0}; selected=null; history.length=0; future.length=0; updateHist(); dirty=true; } };
 bar.addEventListener("pointerdown",e=>e.stopPropagation());
 showTools.addEventListener("pointerdown",e=>e.stopPropagation());
