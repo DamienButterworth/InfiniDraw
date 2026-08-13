@@ -47,6 +47,25 @@
   .bgpick input{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer}
   .bgpick .dot{width:16px;height:16px;border-radius:4px;border:1.5px solid rgba(255,255,255,.35);box-shadow:inset 0 0 0 1px rgba(0,0,0,.15)}
   .sw-custom .ring{position:absolute;inset:0;border-radius:50%;background:conic-gradient(#f43f5e,#f59e0b,#eab308,#22c55e,#06b6d4,#6366f1,#d946ef,#f43f5e)}
+  /* built-in colour picker (replaces the native <input type=color>, which on many phones
+     offers only a fixed swatch grid rather than the full spectrum) */
+  .cpick{position:fixed;z-index:20;display:flex;flex-direction:column;gap:10px;width:232px;padding:12px;
+    background:color-mix(in srgb,var(--bar) 96%,transparent);backdrop-filter:blur(10px) saturate(1.2);
+    border:1px solid var(--bar-edge);border-radius:16px;box-shadow:0 12px 40px rgba(20,22,28,.45)}
+  .cpick[hidden]{display:none}
+  .cp-sv{position:relative;width:208px;height:132px;border-radius:10px;cursor:crosshair;touch-action:none;
+    background:linear-gradient(to bottom,rgba(0,0,0,0),#000),linear-gradient(to right,#fff,rgba(255,255,255,0)),#f00}
+  .cp-dot{position:absolute;width:16px;height:16px;border-radius:50%;border:2px solid #fff;box-shadow:0 0 0 1px rgba(0,0,0,.5);transform:translate(-50%,-50%);pointer-events:none}
+  .cp-hue input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:14px;border-radius:999px;outline:none;
+    background:linear-gradient(to right,#f00,#ff0,#0f0,#0ff,#00f,#f0f,#f00)}
+  .cp-hue input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;border-radius:50%;background:#fff;border:2px solid #2a2c33;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.4)}
+  .cp-hue input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;background:#fff;border:2px solid #2a2c33;cursor:pointer}
+  .cp-foot{display:flex;align-items:center;gap:7px}
+  .cp-prev{width:26px;height:26px;border-radius:7px;border:1px solid var(--bar-edge);flex:0 0 auto}
+  .cp-hash{color:var(--muted);font-size:13px}
+  .cp-hex{flex:1;min-width:0;background:#33363e;border:1px solid #454953;border-radius:8px;color:var(--text);
+    font:600 13px ui-monospace,monospace;padding:6px 8px;text-transform:uppercase;letter-spacing:.5px;-webkit-appearance:none}
+  .cp-done{height:32px;background:var(--accent);color:var(--accent-ink);flex:0 0 auto;padding:0 12px}
   .slider{display:inline-flex;align-items:center;gap:7px;padding:0 5px}
   .slider label{color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.4px}
   .slider input[type=range]{-webkit-appearance:none;appearance:none;width:78px;height:4px;background:#4a4e58;border-radius:999px;outline:none}
@@ -104,11 +123,11 @@
     <button class="sw" style="background:#f0a020" data-color="#f0a020"></button>
     <button class="sw" style="background:#2f9e44" data-color="#2f9e44"></button>
     <button class="sw" style="background:#2d7ff9" data-color="#2d7ff9"></button>
-    <button class="sw sw-custom" title="Custom color"><span class="ring"></span><input type="color" id="customColor" value="#8b5cf6"></button>
+    <button class="sw sw-custom" id="customColor" title="Custom color"><span class="ring"></span></button>
   </div>
 
   <span class="sep"></span>
-  <label class="btn bgpick" id="bgWrap" title="Canvas color"><span class="dot" id="bgDot" style="background:#f7f6f2"></span><input type="color" id="bgColorPick" value="#f7f6f2"></label>
+  <button class="btn bgpick" id="bgWrap" title="Canvas color"><span class="dot" id="bgDot" style="background:#f7f6f2"></span></button>
 
   <span class="sep"></span>
   <div class="slider sz"><label>size</label><input type="range" id="size" min="1" max="60" value="4"></div>
@@ -126,6 +145,16 @@
   <button class="btn" id="hideBtn" title="Hide toolbar (Tab)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></button>
 </div>
 
+<div class="cpick" id="cpick" hidden>
+  <div class="cp-sv" id="cpSV"><i class="cp-dot" id="cpSVDot"></i></div>
+  <div class="cp-hue"><input type="range" id="cpHue" min="0" max="360" value="270"></div>
+  <div class="cp-foot">
+    <span class="cp-prev" id="cpPrev"></span>
+    <span class="cp-hash">#</span><input type="text" id="cpHex" maxlength="7" spellcheck="false" autocapitalize="off" autocomplete="off">
+    <button class="btn cp-done" id="cpDone">Done</button>
+  </div>
+</div>
+
 <div class="hint" id="hint">
   <span><kbd>Scroll</kbd> / pinch to zoom — endless nested detail</span>
   <span class="desktop-only"><kbd>Space</kbd>-drag or two-finger pan · flick to coast</span>
@@ -136,6 +165,8 @@
 "use strict";
 const canvas=document.getElementById("c"), ctx=canvas.getContext("2d");
 const layer=document.createElement("canvas"), lctx=layer.getContext("2d");   // offscreen for isolating each object's erase mask
+const sceneSnap=document.createElement("canvas"), snapCtx=sceneSnap.getContext("2d");   // frozen copy of the scene during an active stroke (see draw())
+let snapValid=false;
 let g=ctx;                                                                    // item-drawing target: main ctx, or the layer while masking
 const fileInput=document.getElementById("file"), jsonFile=document.getElementById("jsonFile");
 const ACCENT="#2dd4bf";
@@ -174,6 +205,7 @@ function resize(){
   canvas.width=Math.round(W*dpr); canvas.height=Math.round(H*dpr);
   canvas.style.width=W+"px"; canvas.style.height=H+"px";
   layer.width=canvas.width; layer.height=canvas.height;
+  sceneSnap.width=canvas.width; sceneSnap.height=canvas.height; snapValid=false;
   ctx.setTransform(dpr,0,0,dpr,0,0); ctx.imageSmoothingEnabled=true;
   lctx.imageSmoothingEnabled=true;
   if(camScale===1){ camScale=VIEW; targetScale=VIEW; }
@@ -415,12 +447,26 @@ function drawLodCover(f){                                                    // 
   g=og;
   ctx.save(); ctx.setTransform(1,0,0,1,0,0); ctx.globalAlpha=it.alpha!=null?it.alpha:1; ctx.drawImage(layer,0,0); ctx.restore();
 }
-function draw(){
+function renderWorld(){
   ctx.clearRect(0,0,W,H);
   const f=lodFill();
   if(typeof f==="string"){ ctx.fillStyle=f; ctx.fillRect(0,0,W,H); }        // solid deep-zoom backdrop
   else if(f){ drawLodCover(f); }                                            // holed covering stroke — keep it (and its hole) visible
   renderScene({x:camX,y:camY,scale:camScale});
+}
+/* Freeze the scene (minus the stroke about to start) into sceneSnap. The camera is static
+   for the whole of a one-finger draw, so during the drag we can just blit this snapshot and
+   paint the live stroke on top — one cheap frame instead of re-compositing the entire scene
+   every pointer move, which on a phone dropped/tore frames and left an offset ghost. */
+function snapshotScene(){ renderWorld(); snapCtx.setTransform(1,0,0,1,0,0); snapCtx.clearRect(0,0,sceneSnap.width,sceneSnap.height); snapCtx.drawImage(canvas,0,0); snapValid=true; }
+function draw(){
+  if((mode==="draw"||mode==="shape")&&draft&&snapValid){                    // active stroke: blit frozen scene, draw only the live stroke
+    ctx.setTransform(1,0,0,1,0,0); ctx.clearRect(0,0,canvas.width,canvas.height); ctx.drawImage(sceneSnap,0,0); ctx.setTransform(dpr,0,0,dpr,0,0);
+    const cam={x:camX,y:camY,scale:camScale}; g=ctx; ctx.globalCompositeOperation="source-over"; ctx.globalAlpha=draft.alpha!=null?draft.alpha:1;
+    if(draft.kind==="stroke") drawStrokeItem(draft,cam); else drawShapeItem(draft,cam);
+    ctx.globalAlpha=1; drawCursorRing(); return;
+  }
+  renderWorld();
   if(previewRect){ ctx.strokeStyle=ACCENT; ctx.setLineDash([7,5]); ctx.lineWidth=1.5; ctx.strokeRect(previewRect.x,previewRect.y,previewRect.w,previewRect.h); ctx.setLineDash([]); }
   if(tool==="select"&&selected&&current.items.indexOf(selected)>=0) drawSelection();
   if(tool==="loupe") drawLoupe();
@@ -511,7 +557,7 @@ function loop(){ const now=performance.now(); const dt=Math.min(0.05,(now-lastT)
 /* ---------------- zoom ---------------- */
 function wheelZoom(px,py,mult){ anchorSX=px; anchorSY=py; targetScale=Math.max(camScale*1e-3,Math.min(camScale*1e3,targetScale*mult)); }
 function zoomCenter(f){ anchorSX=W/2; anchorSY=H/2; targetScale*=f; }
-function zoomAction(f){ anim=null; if(tool==="loupe") adjustLoupe(f); else zoomCenter(f); }   // + / - controls lens mag when the loupe is active
+function zoomAction(f){ anim=null; if(tool==="loupe") adjustLoupe(f); else { zoomCenter(f); scheduleSave(); } }   // + / - controls lens mag when the loupe is active
 
 /* ---------------- fly-to outer / inner drawing ----------------
    Content lives at many nesting depths; a node's depth is captured by K, the product of
@@ -552,12 +598,12 @@ function stepAnim(now){
   const px=anim.p0x+(anim.p1x-anim.p0x)*e, py=anim.p0y+(anim.p1y-anim.p0y)*e;   // ease the anchor's screen position along its endpoints
   current=anim.node; camScale=scale; targetScale=scale;
   camX=anim.ax-(px-W/2)/scale; camY=anim.ay-(py-H/2)/scale;           // zoom anchored on the "small" endpoint keeps it framed both ways
-  if(u>=1) anim=null;   // clear before reframe() so its normal rebasing (node creation) resumes on the final frame
+  if(u>=1){ anim=null; scheduleSave(); }   // clear before reframe() so its normal rebasing (node creation) resumes on the final frame
   reframe(); dirty=true;
 }
 
 /* ---------------- history ---------------- */
-function pushHist(op){ history.push(op); future.length=0; updateHist(); }
+function pushHist(op){ history.push(op); future.length=0; updateHist(); scheduleSave(); }
 function applyRemove(node,it){ const i=node.items.indexOf(it); if(i>=0) node.items.splice(i,1); markDirty(node); }
 function undo(){ const op=history.pop(); if(!op) return;
   if(op.type==="add") applyRemove(op.node,op.item);
@@ -566,7 +612,7 @@ function undo(){ const op=history.pop(); if(!op) return;
     for(let i=op.removed.length-1;i>=0;i--){ const r=op.removed[i]; r.parent.children.splice(r.index,0,r.child); markDirty(r.parent); } }   // re-attach pruned frames
   else if(op.type==="transform"){ setGeom(op.item,op.before); markDirty(op.node); }
   else if(op.type==="items"){ op.node.items=op.before.slice(); markDirty(op.node); }
-  future.push(op); updateHist(); dirty=true; }
+  future.push(op); updateHist(); dirty=true; scheduleSave(); }
 function redo(){ const op=future.pop(); if(!op) return;
   if(op.type==="add"){ op.node.items.push(op.item); markDirty(op.node); }
   else if(op.type==="erase"){ for(const r of [...op.removed].sort((a,b)=>b.i-a.i)){ const i=op.node.items.indexOf(r.item); if(i>=0) op.node.items.splice(i,1);} markDirty(op.node); }
@@ -574,7 +620,7 @@ function redo(){ const op=future.pop(); if(!op) return;
     for(const r of op.removed){ const i=r.parent.children.indexOf(r.child); if(i>=0) r.parent.children.splice(i,1); markDirty(r.parent); } }   // re-prune emptied frames
   else if(op.type==="transform"){ setGeom(op.item,op.after); markDirty(op.node); }
   else if(op.type==="items"){ op.node.items=op.after.slice(); markDirty(op.node); }
-  history.push(op); updateHist(); dirty=true; }
+  history.push(op); updateHist(); dirty=true; scheduleSave(); }
 function updateHist(){ document.getElementById("undo").disabled=!history.length; document.getElementById("redo").disabled=!future.length; }
 
 /* ---------------- pointer / drawing ---------------- */
@@ -600,7 +646,7 @@ function extendStroke(p,e){
 }
 function startShape(p,shape){ const it={kind:"shape",shape,color,alpha:opacity,base:baseWorld(),x0:wX(p.x),y0:wY(p.y),x1:wX(p.x),y1:wY(p.y)}; current.items.push(it); draft=it; markDirty(current); dirty=true; }
 function extendShape(p){ if(!draft) return; draft.x1=wX(p.x); draft.y1=wY(p.y); markDirty(current); dirty=true; }
-function commitDraft(){ if(!draft) return; const d=draft; draft=null; lastW=0;
+function commitDraft(){ if(!draft) return; const d=draft; draft=null; lastW=0; snapValid=false;
   if(d.kind==="shape"&&Math.hypot(sxNow(d.x1)-sxNow(d.x0),syNow(d.y1)-syNow(d.y0))<3){ applyRemove(current,d); return; }
   pushHist({type:"add",node:current,item:d}); }
 
@@ -819,9 +865,9 @@ function serItem(it){ if(it.kind==="raster"){ let data=""; try{ if(it.src.toData
 function serNode(n){ return {items:n.items.map(serItem), children:n.children.map(c=>({x:c.x,y:c.y,k:c.k,node:serNode(c.node)}))}; }
 function download(name,blob){ const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download=name; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1500); }
 function pathToCurrent(){ const p=[]; let n=current; while(n.up){ const ch=n.up, idx=ch.parent.children.indexOf(ch); p.push(idx); n=ch.parent; } return p.reverse(); }
+function buildPayload(){ return {app:"infinite-zoom-studio",version:3,bg:bgColor,view:{path:pathToCurrent(),camX,camY,sc:camScale/VIEW},root:serNode(root)}; }
 async function exportDrawing(){
-  const payload={app:"infinite-zoom-studio",version:3,bg:bgColor,view:{path:pathToCurrent(),camX,camY,sc:camScale/VIEW},root:serNode(root)};
-  const data=JSON.stringify(payload);
+  const data=JSON.stringify(buildPayload());
   try{ if(window.CompressionStream){ const stream=new Blob([data]).stream().pipeThrough(new CompressionStream("gzip"));
     const blob=await new Response(stream).blob(); download("infinite-zoom-drawing.json.gz",blob); return; } }catch(e){}
   download("infinite-zoom-drawing.json",new Blob([data],{type:"application/json"}));
@@ -829,14 +875,30 @@ async function exportDrawing(){
 function deserItem(o,node){ if(o.kind==="raster"){ const img=new Image(); const it={kind:"raster",x:o.x,y:o.y,s:o.s,alpha:o.alpha==null?1:o.alpha,src:img,erases:o.erases}; img.onload=()=>{ markDirty(node); dirty=true; }; img.src=o.data; return it; } return o; }
 function deserNode(o){ const n=makeNode(); n.items=(o.items||[]).map(it=>deserItem(it,n));
   n.children=(o.children||[]).map(c=>{ const node=deserNode(c.node); const child={x:c.x,y:c.y,k:c.k,node,parent:n}; node.up=child; return child; }); n.dirty=true; n.bbox=undefined; return n; }
-function importDrawing(text){ let o; try{ o=JSON.parse(text); }catch(e){ hintFlash("Couldn't read that file"); return; }
-  if(!o||!o.root){ hintFlash("Not a valid drawing file"); return; }
+function loadState(o){                                              // rebuild scene + camera from a parsed payload (shared by file import and autosave restore)
   root=deserNode(o.root); pVel={x:0,y:0}; selected=null; history.length=0; future.length=0; updateHist();
   let cur=root, ok=true; const v=o.view||{};                       // restore camera + which frame you were in
   for(const idx of (v.path||[])){ if(cur.children&&cur.children[idx]) cur=cur.children[idx].node; else { ok=false; break; } }
   current=ok?cur:root; camX=v.camX||0; camY=v.camY||0; camScale=(v.sc||1)*VIEW; targetScale=camScale;
   bgColor=o.bg||null; applyBg();                                   // restore saved canvas colour
-  markDirty(root); dirty=true; hintFlash("Drawing loaded"); }
+  markDirty(root); dirty=true; }
+function importDrawing(text){ let o; try{ o=JSON.parse(text); }catch(e){ hintFlash("Couldn't read that file"); return; }
+  if(!o||!o.root){ hintFlash("Not a valid drawing file"); return; }
+  loadState(o); hintFlash("Drawing loaded"); }
+
+/* Autosave: persist the whole scene to localStorage so a closed/reopened tab resumes where
+   it left off. (Cookies can't hold this — ~4KB cap and sent on every request.) Writes are
+   debounced and skipped mid-interaction so transient draft/erase state never lands on disk. */
+const SAVE_KEY="infinidraw.autosave"; let saveTimer=null;
+function saveLocal(){
+  if(mode!==null||draft){ scheduleSave(); return; }                // an interaction is live — defer until it settles
+  try{ localStorage.setItem(SAVE_KEY,JSON.stringify(buildPayload())); }catch(e){}   // quota exceeded / private mode: silently skip
+}
+function scheduleSave(){ clearTimeout(saveTimer); saveTimer=setTimeout(saveLocal,1000); }
+function restoreLocal(){ let text; try{ text=localStorage.getItem(SAVE_KEY); }catch(e){ return; }
+  if(!text) return; let o; try{ o=JSON.parse(text); }catch(e){ return; } if(!o||!o.root) return; loadState(o); }
+addEventListener("visibilitychange",()=>{ if(document.visibilityState==="hidden") saveLocal(); });   // flush before the tab is backgrounded/closed
+addEventListener("pagehide",saveLocal);
 document.getElementById("exportBtn").onclick=exportDrawing;
 document.getElementById("importBtn").onclick=()=>{ jsonFile.value=""; jsonFile.click(); };
 jsonFile.addEventListener("change",()=>{ const f=jsonFile.files&&jsonFile.files[0]; if(!f)return; const r=new FileReader();
@@ -858,8 +920,8 @@ canvas.addEventListener("pointerdown",e=>{
     const[a,b]=[...pointers.values()]; pinchStart={dist:Math.hypot(a.x-b.x,a.y-b.y),cx:(a.x+b.x)/2,cy:(a.y+b.y)/2,_t:performance.now()}; dirty=true; return; }
   const wantPan=tool==="hand"||spaceHeld||e.button===1||e.button===2;
   if(wantPan){ mode="pan"; panLast=p; setCursor(); return; }
-  if(tool==="pen"||tool==="brush"||tool==="marker"){ mode="draw"; lastMoveT=performance.now(); lastW=0; startStroke(p,tool,e); }
-  else if(tool==="line"||tool==="rect"||tool==="ellipse"){ mode="shape"; startShape(p,tool); }
+  if(tool==="pen"||tool==="brush"||tool==="marker"){ mode="draw"; lastMoveT=performance.now(); lastW=0; snapshotScene(); startStroke(p,tool,e); }
+  else if(tool==="line"||tool==="rect"||tool==="ellipse"){ mode="shape"; snapshotScene(); startShape(p,tool); }
   else if(tool==="eraser"){ mode="erase"; eraseSnap=new Map(); eraseLast=new Map(); eraseSample(p); }
   else if(tool==="select"){ selectPointerDown(p); }
   else if(tool==="image"){ if(pendingImage){ mode="placeimg"; placeAnchor=p; previewRect={x:p.x,y:p.y,w:0,h:0}; } else { fileInput.value=""; fileInput.click(); } }
@@ -894,14 +956,14 @@ function release(e){
   else if(mode==="pinch"){ if(pointers.size===1){ mode="pan"; panLast=[...pointers.values()][0]; mvLast={x:panLast.x,y:panLast.y,t:performance.now()}; } else if(pointers.size===0){ mode=null; pVel={x:mvVel.x,y:mvVel.y}; } }
   else if(mode==="pan"){ if(pointers.size===0){ mode=null; panLast=null; pVel={x:mvVel.x,y:mvVel.y}; } }
   if(lastPointerType==="touch"&&pointers.size===0) cursor=null;   // no hover on touch — drop the loupe when the finger lifts
-  setCursor(); dirty=true;
+  setCursor(); dirty=true; if(pointers.size===0) scheduleSave();  // persist camera/content once the gesture (and any coast) settles
 }
 canvas.addEventListener("pointerup",release);
 canvas.addEventListener("pointercancel",release);
 canvas.addEventListener("pointerleave",e=>{ if(!pointers.has(e.pointerId)){ cursor=null; dirty=true; } });
 canvas.addEventListener("wheel",e=>{ e.preventDefault(); anim=null; const p=local(e); cursor=p;
   if(tool==="loupe"){ adjustLoupe(Math.exp(-e.deltaY*0.003)); return; }   // scroll adjusts the lens, not the canvas
-  wheelZoom(p.x,p.y,Math.exp(-e.deltaY*(e.ctrlKey?0.012:0.0016))); },{passive:false});
+  wheelZoom(p.x,p.y,Math.exp(-e.deltaY*(e.ctrlKey?0.012:0.0016))); scheduleSave(); },{passive:false});
 canvas.addEventListener("contextmenu",e=>e.preventDefault());
 
 /* ---------------- keyboard ---------------- */
@@ -960,10 +1022,58 @@ grip.addEventListener("pointerup",endDock); grip.addEventListener("pointercancel
 const swatches=document.getElementById("swatches");
 function activateSwatch(el){ swatches.querySelectorAll(".sw").forEach(s=>s.classList.remove("active")); el.classList.add("active"); }
 swatches.querySelectorAll(".sw[data-color]").forEach(sw=>{ sw.onclick=()=>{ color=sw.dataset.color; activateSwatch(sw); if(tool==="eraser")setTool("pen"); }; });
-const cc=document.getElementById("customColor"); cc.oninput=()=>{ color=cc.value; activateSwatch(cc.closest(".sw")); if(tool==="eraser")setTool("pen"); };
-const bgPick=document.getElementById("bgColorPick"), bgDot=document.getElementById("bgDot");
-function applyBg(){ document.body.style.background=bgColor||""; if(bgColor){ bgDot.style.background=bgColor; bgPick.value=bgColor; } dirty=true; }  // erased/empty areas show the page bg through the transparent canvas
-bgPick.oninput=()=>{ bgColor=bgPick.value; applyBg(); };
+const bgDot=document.getElementById("bgDot");
+function applyBg(){ document.body.style.background=bgColor||""; if(bgColor) bgDot.style.background=bgColor; dirty=true; scheduleSave(); }  // erased/empty areas show the page bg through the transparent canvas
+
+/* ---------------- built-in colour picker ----------------
+   A self-contained HSV picker (saturation/value box + hue slider + hex field) so colour
+   selection is the full spectrum on every device — the native <input type=color> falls back
+   to a limited swatch grid on many phones. Drives either the ink colour or the canvas bg. */
+const customBtn=document.getElementById("customColor"), bgBtn=document.getElementById("bgWrap");
+const cpick=document.getElementById("cpick"), cpSV=document.getElementById("cpSV"), cpSVDot=document.getElementById("cpSVDot"),
+      cpHue=document.getElementById("cpHue"), cpHex=document.getElementById("cpHex"), cpPrev=document.getElementById("cpPrev"), cpDone=document.getElementById("cpDone");
+let cpTarget="ink", cpH=270, cpS=0.6, cpV=0.9;
+function hsv2rgb(h,s,v){ h=(h%360)/60; const c=v*s,x=c*(1-Math.abs(h%2-1)),m=v-c; let r=0,gg=0,b=0;
+  if(h<1){r=c;gg=x;} else if(h<2){r=x;gg=c;} else if(h<3){gg=c;b=x;} else if(h<4){gg=x;b=c;} else if(h<5){r=x;b=c;} else {r=c;b=x;}
+  return [Math.round((r+m)*255),Math.round((gg+m)*255),Math.round((b+m)*255)]; }
+function rgb2hsv(r,g,b){ r/=255;g/=255;b/=255; const mx=Math.max(r,g,b),mn=Math.min(r,g,b),d=mx-mn; let h=0;
+  if(d){ if(mx===r)h=((g-b)/d)%6; else if(mx===g)h=(b-r)/d+2; else h=(r-g)/d+4; h*=60; if(h<0)h+=360; }
+  return [h,mx?d/mx:0,mx]; }
+const hex2=n=>n.toString(16).padStart(2,"0");
+function cpHexStr(){ const [r,g,b]=hsv2rgb(cpH,cpS,cpV); return "#"+hex2(r)+hex2(g)+hex2(b); }
+function cpFromHex(hex){ const c=/^#?([0-9a-f]{6}|[0-9a-f]{3})$/i.exec((hex||"").trim()); if(!c) return false;
+  let h=c[1]; if(h.length===3) h=h.split("").map(x=>x+x).join("");
+  const [H,S,V]=rgb2hsv(parseInt(h.slice(0,2),16),parseInt(h.slice(2,4),16),parseInt(h.slice(4,6),16)); cpH=H; cpS=S; cpV=V; return true; }
+function cpRender(){
+  const [hr,hg,hb]=hsv2rgb(cpH,1,1);
+  cpSV.style.background=`linear-gradient(to bottom,rgba(0,0,0,0),#000),linear-gradient(to right,#fff,rgba(255,255,255,0)),rgb(${hr},${hg},${hb})`;
+  cpSVDot.style.left=(cpS*100)+"%"; cpSVDot.style.top=((1-cpV)*100)+"%";
+  const hex=cpHexStr(); cpPrev.style.background=hex; cpSVDot.style.background=hex;
+  cpHue.value=Math.round(cpH); if(document.activeElement!==cpHex) cpHex.value=hex.slice(1).toUpperCase();
+}
+function cpApply(){ const hex=cpHexStr();
+  if(cpTarget==="ink"){ color=hex; activateSwatch(customBtn); if(tool==="eraser")setTool("pen"); dirty=true; }
+  else { bgColor=hex; applyBg(); } }
+function openPicker(target,anchor){ cpTarget=target;
+  cpFromHex(target==="ink"?color:(bgColor||"#f7f6f2")); cpRender(); cpick.hidden=false;
+  const r=anchor.getBoundingClientRect(), pw=cpick.offsetWidth, ph=cpick.offsetHeight;
+  let left=r.left+r.width/2-pw/2, top=r.bottom+8; if(top+ph>innerHeight-8) top=r.top-ph-8;   // flip above when no room below
+  cpick.style.left=Math.max(8,Math.min(innerWidth-pw-8,left))+"px"; cpick.style.top=Math.max(8,Math.min(innerHeight-ph-8,top))+"px"; }
+function closePicker(){ cpick.hidden=true; }
+function cpSVAt(cx,cy){ const r=cpSV.getBoundingClientRect();
+  cpS=Math.max(0,Math.min(1,(cx-r.left)/r.width)); cpV=1-Math.max(0,Math.min(1,(cy-r.top)/r.height)); cpRender(); cpApply(); }
+let cpDrag=false;
+cpSV.addEventListener("pointerdown",e=>{ cpDrag=true; cpSV.setPointerCapture(e.pointerId); cpSVAt(e.clientX,e.clientY); e.preventDefault(); });
+cpSV.addEventListener("pointermove",e=>{ if(cpDrag) cpSVAt(e.clientX,e.clientY); });
+cpSV.addEventListener("pointerup",()=>{ cpDrag=false; });
+cpSV.addEventListener("pointercancel",()=>{ cpDrag=false; });
+cpHue.addEventListener("input",()=>{ cpH=+cpHue.value; cpRender(); cpApply(); });
+cpHex.addEventListener("input",()=>{ if(cpFromHex(cpHex.value)){ cpRender(); cpApply(); } });
+cpDone.addEventListener("click",closePicker);
+cpick.addEventListener("pointerdown",e=>e.stopPropagation());
+customBtn.addEventListener("click",()=>openPicker("ink",customBtn));
+bgBtn.addEventListener("click",()=>openPicker("bg",bgBtn));
+addEventListener("pointerdown",e=>{ if(!cpick.hidden && !cpick.contains(e.target) && !customBtn.contains(e.target) && !bgBtn.contains(e.target)) closePicker(); });
 document.getElementById("size").oninput=e=>{ size=+e.target.value; dirty=true; };
 document.getElementById("opacity").oninput=e=>{ opacity=+e.target.value/100; dirty=true; };
 document.getElementById("undo").onclick=undo;
@@ -972,7 +1082,7 @@ document.getElementById("zoomIn").onclick=()=>zoomAction(1.3);
 document.getElementById("zoomOut").onclick=()=>zoomAction(1/1.3);
 document.getElementById("zoomOuter").onclick=()=>zoomToExtreme(true);
 document.getElementById("zoomInner").onclick=()=>zoomToExtreme(false);
-document.getElementById("clear").onclick=()=>{ if(confirm("Start a new canvas? This clears everything.")){ root=makeNode(); current=root; camX=camY=0; camScale=VIEW; targetScale=VIEW; pVel={x:0,y:0}; selected=null; history.length=0; future.length=0; updateHist(); dirty=true; } };
+document.getElementById("clear").onclick=()=>{ if(confirm("Start a new canvas? This clears everything.")){ root=makeNode(); current=root; camX=camY=0; camScale=VIEW; targetScale=VIEW; pVel={x:0,y:0}; selected=null; history.length=0; future.length=0; updateHist(); dirty=true; saveLocal(); } };
 bar.addEventListener("pointerdown",e=>e.stopPropagation());
 showTools.addEventListener("pointerdown",e=>e.stopPropagation());
 
@@ -981,7 +1091,7 @@ function hintFlash(msg){ hint.classList.remove("fade"); hint.innerHTML="<span>"+
 setTimeout(()=>hint.classList.add("fade"),7000);
 
 /* ---------------- go ---------------- */
-resize(); setTool("pen"); updateHist(); requestAnimationFrame(loop);
+resize(); setTool("pen"); restoreLocal(); updateHist(); requestAnimationFrame(loop);
 })();
 </script>
 </body>
