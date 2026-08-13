@@ -295,6 +295,14 @@ function drawItems(node,cam){
     if(it.dead) continue;                                                   // whole-object erased this drag; removed for good on commit
     const ib=itemBounds(it);
     if(!(Math.max(ib.x1-ib.x0,ib.y1-ib.y0)*cam.scale<hangCap)) continue;   // NaN/Infinity or absurd size would hang the rasterizer; LOD background fill still covers screen-wide coverage
+    // Item-level screen cull: skip anything whose on-screen box lies fully outside the viewport.
+    // itemBounds already includes point width for pens/brushes; pad extra for marker over-width,
+    // shape stroke, and erase spill so a thick body straddling the edge is never wrongly dropped.
+    let cpad=(it.base||0)*cam.scale*1.3+2;
+    if(it.erases) for(const e of it.erases) cpad=Math.max(cpad,e.base*cam.scale/2);
+    if(it.holes) for(const h of it.holes) cpad=Math.max(cpad,h.r*cam.scale);
+    const cx0=nSX(cam,ib.x0),cx1=nSX(cam,ib.x1),cy0=nSY(cam,ib.y0),cy1=nSY(cam,ib.y1);
+    if(Math.max(cx0,cx1)<-cpad||Math.min(cx0,cx1)>W+cpad||Math.max(cy0,cy1)<-cpad||Math.min(cy0,cy1)>H+cpad) continue;
     if(!isMasked(it)){                                                      // fast path: no mask, draw straight to main ctx
       g=ctx; ctx.globalAlpha=it.alpha!=null?it.alpha:1; drawOneItem(it,cam); continue;
     }
@@ -338,23 +346,24 @@ function rasterPixelColor(it,ix,iy){ if(!rasterOK(it)) return null;
   px1ctx.clearRect(0,0,1,1); try{ px1ctx.drawImage(it.src,ix,iy,1,1,0,0,1,1); }catch(e){ return null; }
   const d=px1ctx.getImageData(0,0,1,1).data; return d[3]<8?null:`rgb(${d[0]},${d[1]},${d[2]})`;
 }
-/* State of a covering item's erase holes relative to the viewport centre:
-   'hole' = centre sits inside a hole (see-through);
-   'edge' = a hole edge crosses the viewport, so the item is NOT a solid flat fill
-            (must fall through to real geometry so the hole is visible);
+/* State of a covering item's erase holes relative to the viewport:
+   'hole' = the whole viewport sits inside one hole (fully see-through — the item is off-screen);
+   'edge' = a hole crosses the viewport, so the item is a field with a hole in it (drawn as such by
+            drawLodCover — NOT punted to geometry, which is culled at this depth and would vanish);
    ''     = solid across the whole viewport. */
 function eraseCoverState(it,px,py,marginW){
   let edge=false;
   if(it.erases) for(const e of it.erases){ const hw=e.base/2, p=e.pts;
     for(let i=0;i<p.length;i++){ const d=(i+1<p.length)?segDist(px,py,p[i].x,p[i].y,p[i+1].x,p[i+1].y):Math.hypot(px-p[i].x,py-p[i].y);
-      if(d<=hw) return "hole";
-      if(d-hw<marginW) edge=true; } }
+      if(d+marginW<=hw) return "hole";                                       // viewport wholly inside the erased band
+      if(d-hw<marginW) edge=true; } }                                        // erased band edge crosses the viewport
   if(it.holes) for(const h of it.holes){ const d=Math.hypot(px-h.x,py-h.y);
-    if(d<=h.r) return "hole";
-    if(d-h.r<marginW) edge=true; }
+    if(d+marginW<=h.r) return "hole";                                        // viewport wholly inside the hole
+    if(d-h.r<marginW) edge=true; }                                          // hole edge crosses the viewport
   return edge?"edge":"";
 }
-// undefined = item doesn't cover the viewport; null = covers but centre is see-through; string = fill colour
+const EDGE={};   // coverColor sentinel: item covers the viewport but has a hole crossing it (partial cover)
+// undefined = item doesn't cover the viewport; null = covers but viewport is fully see-through; EDGE = holed cover; string = solid fill colour
 function coverColor(it,px,py,scale,marginW){
   if(it.kind==="stroke"||(it.kind==="shape"&&it.shape==="line")){
     if(it.base*scale<Math.hypot(W,H)) return undefined;                     // too thin on-screen to cover — quick reject
@@ -362,7 +371,7 @@ function coverColor(it,px,py,scale,marginW){
         for(let i=0;i<p.length;i++){ const dd=(i+1<p.length)?segDist(px,py,p[i].x,p[i].y,p[i+1].x,p[i+1].y):Math.hypot(px-p[i].x,py-p[i].y); if(dd<d)d=dd; } }
       else d=segDist(px,py,it.x0,it.y0,it.x1,it.y1);
     if(d+marginW>it.base/2) return undefined;                               // viewport not wholly inside the stroke body
-    const st=eraseCoverState(it,px,py,marginW); if(st==="hole") return null; if(st==="edge") return undefined;
+    const st=eraseCoverState(it,px,py,marginW); if(st==="hole") return null; if(st==="edge") return EDGE;
     return it.color;
   }
   if(it.kind==="raster"){ const b=itemBounds(it);
@@ -372,19 +381,41 @@ function coverColor(it,px,py,scale,marginW){
   }
   return undefined;                                                         // rect/ellipse outlines: no LOD fill
 }
-function lodFillColor(){
+/* Returns the deep-zoom backdrop: a colour string (solid cover), null (paper), or a
+   {item,cam,behind} descriptor for a holed covering stroke — drawn by drawLodCover as a
+   flat field with its holes punched through to `behind`, so you can zoom into/through a
+   hole instead of the whole line vanishing when its geometry is culled at this depth. */
+function lodFill(){
   let px=camX,py=camY,scale=camScale,node=current; const half=Math.hypot(W,H)/2;
+  let cover=null;                                                           // frontmost holed cover awaiting its backdrop
   for(let L=0;L<48;L++){ const marginW=half/scale;                          // half-viewport, in this node's world units
     for(let i=node.items.length-1;i>=0;i--){ const it=node.items[i]; if(it.dead) continue; const c=coverColor(it,px,py,scale,marginW);
       if(c===undefined||c===null) continue;                                 // see-through / no cover: keep looking behind
-      return c; }
+      if(c===EDGE){ if(!cover) cover={item:it,cam:{x:px,y:py,scale}}; continue; }   // holed cover: remember frontmost, find what shows through the hole
+      return cover?{item:cover.item,cam:cover.cam,behind:c}:c;              // solid backdrop for the hole
+    }
     if(!node.up) break; const up=node.up; px=up.x+px*up.k; py=up.y+py*up.k; scale/=up.k; node=up.parent;
   }
-  return null;
+  return cover?{item:cover.item,cam:cover.cam,behind:null}:null;            // hole shows paper
+}
+function drawLodCover(f){                                                    // f={item,cam,behind}: flat field of item.color with its holes punched to `behind`
+  const it=f.item, cam=f.cam;
+  ctx.globalAlpha=1;
+  if(f.behind){ ctx.fillStyle=f.behind; ctx.fillRect(0,0,W,H); }            // what shows through the holes
+  lctx.setTransform(1,0,0,1,0,0); lctx.clearRect(0,0,layer.width,layer.height);
+  lctx.setTransform(dpr,0,0,dpr,0,0); lctx.globalCompositeOperation="source-over"; lctx.globalAlpha=1;
+  lctx.fillStyle=it.color; lctx.fillRect(0,0,W,H);                          // the covering ink, full viewport
+  const og=g; g=lctx;
+  if(it.holes) for(const h of it.holes) drawHoleMask(h,cam);                // punch the holes (destination-out)
+  if(it.erases) for(const e of it.erases) drawEraseMask(e,cam);
+  g=og;
+  ctx.save(); ctx.setTransform(1,0,0,1,0,0); ctx.globalAlpha=it.alpha!=null?it.alpha:1; ctx.drawImage(layer,0,0); ctx.restore();
 }
 function draw(){
   ctx.clearRect(0,0,W,H);
-  const fill=lodFillColor(); if(fill){ ctx.fillStyle=fill; ctx.fillRect(0,0,W,H); }
+  const f=lodFill();
+  if(typeof f==="string"){ ctx.fillStyle=f; ctx.fillRect(0,0,W,H); }        // solid deep-zoom backdrop
+  else if(f){ drawLodCover(f); }                                            // holed covering stroke — keep it (and its hole) visible
   renderScene({x:camX,y:camY,scale:camScale});
   if(previewRect){ ctx.strokeStyle=ACCENT; ctx.setLineDash([7,5]); ctx.lineWidth=1.5; ctx.strokeRect(previewRect.x,previewRect.y,previewRect.w,previewRect.h); ctx.setLineDash([]); }
   if(tool==="select"&&selected&&current.items.indexOf(selected)>=0) drawSelection();
@@ -677,8 +708,13 @@ function eraseSample(pt){
 function splitStroke(it){
   const runs=[]; let cur=null;
   for(const p of it.pts){ if(p.e){ cur=null; } else { if(!cur){ cur=[]; runs.push(cur); } cur.push({x:p.x,y:p.y,w:p.w}); } }
-  const hw=(it.base||0)/2;
-  return runs.filter(r=>r.length>1).map(r=>{
+  const hw=(it.base||0)/2, minLen=(it.base||0)*0.6;                         // drop sub-visible stubs erasing scatters (a piece shorter than the line is thick is just a dot the brush sat on) — curbs fragment/item growth
+  return runs.filter(r=>{
+    if(r.length<2) return false;
+    let x0=1/0,y0=1/0,x1=-1/0,y1=-1/0;
+    for(const p of r){ if(p.x<x0)x0=p.x; if(p.x>x1)x1=p.x; if(p.y<y0)y0=p.y; if(p.y>y1)y1=p.y; }
+    return Math.hypot(x1-x0,y1-y0)>=minLen;
+  }).map(r=>{
     const s={kind:"stroke",mode:it.mode,color:it.color,alpha:it.alpha,base:it.base,pts:r,bb:undefined};
     if(it.holes&&it.holes.length){ const bb=strokeBB(s);                    // keep only the holes that touch this piece — don't copy every hole onto every split
       const hs=it.holes.filter(h=>h.x+h.r>=bb.x0-hw&&h.x-h.r<=bb.x1+hw&&h.y+h.r>=bb.y0-hw&&h.y-h.r<=bb.y1+hw);
