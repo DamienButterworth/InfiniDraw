@@ -307,11 +307,15 @@ function drawItems(node,cam){
       g=ctx; ctx.globalAlpha=it.alpha!=null?it.alpha:1; drawOneItem(it,cam); continue;
     }
     const r=itemScreenRect(it,cam); if(r.w<=0||r.h<=0) continue;            // fully offscreen
-    g=lctx; lctx.setTransform(dpr,0,0,dpr,0,0); lctx.globalCompositeOperation="source-over"; lctx.globalAlpha=1;
-    lctx.clearRect(r.x,r.y,r.w,r.h); lctx.save(); lctx.beginPath(); lctx.rect(r.x,r.y,r.w,r.h); lctx.clip();
+    // Clear and copy the SAME integer device-pixel rect, sized to fully contain the (fractional)
+    // CSS clip rect. With a non-integer dpr (phones clamp to 2.5) the old round-based copy rect
+    // could poke past the cleared area and drag in stale `layer` pixels from an earlier erased
+    // item — a ghost. Flooring the origin and ceiling the far edge guarantees clear ⊇ copy.
+    const dx=Math.floor(r.x*dpr),dy=Math.floor(r.y*dpr),dw=Math.ceil((r.x+r.w)*dpr)-dx,dh=Math.ceil((r.y+r.h)*dpr)-dy;
+    g=lctx; lctx.setTransform(1,0,0,1,0,0); lctx.globalCompositeOperation="source-over"; lctx.globalAlpha=1; lctx.clearRect(dx,dy,dw,dh);
+    lctx.setTransform(dpr,0,0,dpr,0,0); lctx.save(); lctx.beginPath(); lctx.rect(r.x,r.y,r.w,r.h); lctx.clip();
     drawOneItem(it,cam); if(it.erases) for(const e of it.erases) drawEraseMask(e,cam); if(it.holes) for(const h of it.holes) drawHoleMask(h,cam); lctx.restore();
     g=ctx; ctx.save(); ctx.globalAlpha=it.alpha!=null?it.alpha:1; ctx.globalCompositeOperation="source-over"; ctx.setTransform(1,0,0,1,0,0);
-    const dx=Math.round(r.x*dpr),dy=Math.round(r.y*dpr),dw=Math.round(r.w*dpr),dh=Math.round(r.h*dpr);
     ctx.drawImage(layer,dx,dy,dw,dh,dx,dy,dw,dh); ctx.restore();
   }
   ctx.globalAlpha=1;
