@@ -155,7 +155,7 @@ let bgColor=null;   // canvas background colour; null = default CSS paper gradie
 /* ---------------- input / physics ---------------- */
 const pointers=new Map();
 let mode=null, panLast=null, pinchStart=null, spaceHeld=false, cursor=null;
-let draft=null, eraseActive=null, eraseBefore=null, eraseLast=null;
+let draft=null, eraseSnap=null, eraseLast=null;   // eraseSnap: node -> pre-drag items clone (for undo); eraseLast: node -> last brush pos (for interpolation)
 let pendingImage=null, placeAnchor=null, previewRect=null;
 let selected=null, dragLast=null, resizeInfo=null, transformSnap=null;
 let dirty=true;
@@ -187,6 +187,20 @@ function hx(c){ c=c.replace('#',''); if(c.length===3)c=c.split('').map(x=>x+x).j
 
 /* ---------------- dirty / bbox ---------------- */
 function markDirty(node){ let n=node; while(n){ n.dirty=true; n=n.up?n.up.parent:null; } }
+function nodeHasContent(node){ if(node.items.length) return true; for(const c of node.children) if(nodeHasContent(c.node)) return true; return false; }
+function onCurrentPath(node){ let n=current; while(n){ if(n===node) return true; n=n.up?n.up.parent:null; } return false; }
+/* Detach every frame that holds no content (and whose whole subtree is empty), except the
+   frame the camera currently lives in. Returns the removed links so the change is undoable. */
+function detachEmptyFrames(){
+  const removed=[];
+  (function rec(node){
+    for(let i=node.children.length-1;i>=0;i--){
+      const c=node.children[i]; rec(c.node);
+      if(!nodeHasContent(c.node) && !onCurrentPath(c.node)){ node.children.splice(i,1); removed.push({parent:node,child:c,index:i}); markDirty(node); }
+    }
+  })(root);
+  return removed;
+}
 function rasterOK(it){ return it.src && it.src.width && it.src.height; }
 function strokeBB(it){ let x0=1/0,y0=1/0,x1=-1/0,y1=-1/0; for(const p of it.pts){ const pad=(p.w||it.base)/2; if(p.x-pad<x0)x0=p.x-pad; if(p.y-pad<y0)y0=p.y-pad; if(p.x+pad>x1)x1=p.x+pad; if(p.y+pad>y1)y1=p.y+pad; } if(!it.pts.length){x0=y0=x1=y1=0;} return {x0,y0,x1,y1}; }
 function itemBounds(it){
@@ -210,26 +224,36 @@ const nSX=(cam,x)=>(x-cam.x)*cam.scale+W/2, nSY=(cam,y)=>(y-cam.y)*cam.scale+H/2
 const capPx=v=>{ const m=(W+H)*2; return v>m?m:v; };
 /* Item drawing targets `g` — normally the main ctx, but the offscreen layer while
    an object is being rendered in isolation so its erase mask affects only itself. */
+/* `p.e` marks a point the eraser has (transiently, mid-drag) removed; the stroke is drawn
+   as the runs of surviving points, so a gap opens live where the brush passes. On commit
+   the runs become independent strokes (splitStroke) and the flags are gone. */
 function drawStrokeItem(it,cam){
   const p=it.pts;
   if(it.mode==="brush"){
     g.fillStyle=it.color;
-    if(p.length===1){ g.beginPath(); g.arc(nSX(cam,p[0].x),nSY(cam,p[0].y),capPx(Math.max(.4,p[0].w*cam.scale/2)),0,6.2832); g.fill(); return; }
-    for(let i=0;i<p.length-1;i++){
-      const ax=nSX(cam,p[i].x),ay=nSY(cam,p[i].y),bx=nSX(cam,p[i+1].x),by=nSY(cam,p[i+1].y);
-      const ra=capPx(Math.max(.4,p[i].w*cam.scale/2)), rb=capPx(Math.max(.4,p[i+1].w*cam.scale/2));
-      const dx=bx-ax,dy=by-ay,len=Math.hypot(dx,dy)||1, nx=-dy/len, ny=dx/len;
-      g.beginPath(); g.moveTo(ax+nx*ra,ay+ny*ra); g.lineTo(bx+nx*rb,by+ny*rb); g.lineTo(bx-nx*rb,by-ny*rb); g.lineTo(ax-nx*ra,ay-ny*ra); g.closePath(); g.fill();
-      g.beginPath(); g.arc(bx,by,rb,0,6.2832); g.fill();
+    for(let i=0;i<p.length;i++){ if(p[i].e) continue;
+      if(i+1<p.length&&!p[i+1].e){
+        const ax=nSX(cam,p[i].x),ay=nSY(cam,p[i].y),bx=nSX(cam,p[i+1].x),by=nSY(cam,p[i+1].y);
+        const ra=capPx(Math.max(.4,p[i].w*cam.scale/2)), rb=capPx(Math.max(.4,p[i+1].w*cam.scale/2));
+        const dx=bx-ax,dy=by-ay,len=Math.hypot(dx,dy)||1, nx=-dy/len, ny=dx/len;
+        g.beginPath(); g.moveTo(ax+nx*ra,ay+ny*ra); g.lineTo(bx+nx*rb,by+ny*rb); g.lineTo(bx-nx*rb,by-ny*rb); g.lineTo(ax-nx*ra,ay-ny*ra); g.closePath(); g.fill();
+      }
+      g.beginPath(); g.arc(nSX(cam,p[i].x),nSY(cam,p[i].y),capPx(Math.max(.4,p[i].w*cam.scale/2)),0,6.2832); g.fill();
     }
-    g.beginPath(); g.arc(nSX(cam,p[0].x),nSY(cam,p[0].y),capPx(Math.max(.4,p[0].w*cam.scale/2)),0,6.2832); g.fill(); return;
+    return;
   }
   const lw=capPx(Math.max(.4,it.base*cam.scale*(it.mode==="marker"?2.2:1)));
-  g.strokeStyle=it.color; g.lineWidth=lw; g.lineCap="round"; g.lineJoin="round";
-  if(p.length===1){ g.fillStyle=it.color; g.beginPath(); g.arc(nSX(cam,p[0].x),nSY(cam,p[0].y),lw/2,0,6.2832); g.fill(); return; }
-  g.beginPath(); g.moveTo(nSX(cam,p[0].x),nSY(cam,p[0].y));
-  for(let i=1;i<p.length-1;i++){ const x=nSX(cam,p[i].x),y=nSY(cam,p[i].y),nx=nSX(cam,p[i+1].x),ny=nSY(cam,p[i+1].y); g.quadraticCurveTo(x,y,(x+nx)/2,(y+ny)/2); }
-  const L=p[p.length-1]; g.lineTo(nSX(cam,L.x),nSY(cam,L.y)); g.stroke();
+  g.strokeStyle=it.color; g.lineWidth=lw; g.lineCap="round"; g.lineJoin="round"; g.fillStyle=it.color;
+  let i=0;
+  while(i<p.length){
+    if(p[i].e){ i++; continue; }
+    let j=i; while(j+1<p.length&&!p[j+1].e) j++;                              // run i..j of surviving points
+    if(i===j){ g.beginPath(); g.arc(nSX(cam,p[i].x),nSY(cam,p[i].y),lw/2,0,6.2832); g.fill(); }
+    else{ g.beginPath(); g.moveTo(nSX(cam,p[i].x),nSY(cam,p[i].y));
+      for(let k=i+1;k<j;k++){ const x=nSX(cam,p[k].x),y=nSY(cam,p[k].y),nx=nSX(cam,p[k+1].x),ny=nSY(cam,p[k+1].y); g.quadraticCurveTo(x,y,(x+nx)/2,(y+ny)/2); }
+      const L=p[j]; g.lineTo(nSX(cam,L.x),nSY(cam,L.y)); g.stroke(); }
+    i=j+1;
+  }
 }
 function drawShapeItem(it,cam){
   const x0=nSX(cam,it.x0),y0=nSY(cam,it.y0),x1=nSX(cam,it.x1),y1=nSY(cam,it.y1);
@@ -249,11 +273,17 @@ function drawEraseMask(e,cam){                                              // o
     for(let i=1;i<p.length;i++) g.lineTo(nSX(cam,p[i].x),nSY(cam,p[i].y)); g.stroke(); }
   g.restore();
 }
+function drawHoleMask(h,cam){                                               // one erase hole, punched via destination-out on `g`
+  g.save(); g.globalCompositeOperation="destination-out"; g.globalAlpha=1; g.fillStyle="#000";
+  g.beginPath(); g.arc(nSX(cam,h.x),nSY(cam,h.y),capPx(Math.max(.5,h.r*cam.scale)),0,6.2832); g.fill(); g.restore();
+}
+function isMasked(it){ return (it.erases&&it.erases.length)||(it.holes&&it.holes.length); }
 function drawOneItem(it,cam){
   if(it.kind==="stroke") drawStrokeItem(it,cam); else if(it.kind==="shape") drawShapeItem(it,cam); else drawRasterItem(it,cam);
 }
 function itemScreenRect(it,cam){                                            // padded on-screen AABB (incl. erase width), clamped to viewport
   const b=itemBounds(it); let pad=2; if(it.erases) for(const e of it.erases) pad=Math.max(pad,e.base*cam.scale/2+2);
+  if(it.holes) for(const h of it.holes) pad=Math.max(pad,h.r*cam.scale+2);
   const xs=[nSX(cam,b.x0),nSX(cam,b.x1)], ys=[nSY(cam,b.y0),nSY(cam,b.y1)];
   const rx=Math.max(0,Math.floor(Math.min(...xs)-pad)), ry=Math.max(0,Math.floor(Math.min(...ys)-pad));
   const rr=Math.min(W,Math.ceil(Math.max(...xs)+pad)), rb=Math.min(H,Math.ceil(Math.max(...ys)+pad));
@@ -262,15 +292,16 @@ function itemScreenRect(it,cam){                                            // p
 function drawItems(node,cam){
   const hangCap=5e6;                                                       // NOT a visible clip plane: only rejects non-finite / astronomically large spans (transient fly-to spikes between distant depths). Real deep-zoom content always renders.
   for(const it of node.items){
+    if(it.dead) continue;                                                   // whole-object erased this drag; removed for good on commit
     const ib=itemBounds(it);
     if(!(Math.max(ib.x1-ib.x0,ib.y1-ib.y0)*cam.scale<hangCap)) continue;   // NaN/Infinity or absurd size would hang the rasterizer; LOD background fill still covers screen-wide coverage
-    if(!it.erases||!it.erases.length){                                     // fast path: no mask, draw straight to main ctx
+    if(!isMasked(it)){                                                      // fast path: no mask, draw straight to main ctx
       g=ctx; ctx.globalAlpha=it.alpha!=null?it.alpha:1; drawOneItem(it,cam); continue;
     }
     const r=itemScreenRect(it,cam); if(r.w<=0||r.h<=0) continue;            // fully offscreen
     g=lctx; lctx.setTransform(dpr,0,0,dpr,0,0); lctx.globalCompositeOperation="source-over"; lctx.globalAlpha=1;
     lctx.clearRect(r.x,r.y,r.w,r.h); lctx.save(); lctx.beginPath(); lctx.rect(r.x,r.y,r.w,r.h); lctx.clip();
-    drawOneItem(it,cam); for(const e of it.erases) drawEraseMask(e,cam); lctx.restore();
+    drawOneItem(it,cam); if(it.erases) for(const e of it.erases) drawEraseMask(e,cam); if(it.holes) for(const h of it.holes) drawHoleMask(h,cam); lctx.restore();
     g=ctx; ctx.save(); ctx.globalAlpha=it.alpha!=null?it.alpha:1; ctx.globalCompositeOperation="source-over"; ctx.setTransform(1,0,0,1,0,0);
     const dx=Math.round(r.x*dpr),dy=Math.round(r.y*dpr),dw=Math.round(r.w*dpr),dh=Math.round(r.h*dpr);
     ctx.drawImage(layer,dx,dy,dw,dh,dx,dy,dw,dh); ctx.restore();
@@ -282,9 +313,9 @@ function renderNode(node,cam,depth){
   for(const child of node.children){
     const cc={scale:cam.scale*child.k,x:(cam.x-child.x)/child.k,y:(cam.y-child.y)/child.k};
     if(cc.scale<0.18||depth>=MAX_DEPTH) continue;
-    const b=bboxOf(child.node);
-    if(b){ const X0=nSX(cc,b.x0),X1=nSX(cc,b.x1),Y0=nSY(cc,b.y0),Y1=nSY(cc,b.y1);
-      if(Math.max(X0,X1)<-60||Math.min(X0,X1)>W+60||Math.max(Y0,Y1)<-60||Math.min(Y0,Y1)>H+60) continue; }
+    const b=bboxOf(child.node); if(!b) continue;                            // empty frame: nothing to draw, don't recurse
+    const X0=nSX(cc,b.x0),X1=nSX(cc,b.x1),Y0=nSY(cc,b.y0),Y1=nSY(cc,b.y1);
+    if(Math.max(X0,X1)<-60||Math.min(X0,X1)>W+60||Math.max(Y0,Y1)<-60||Math.min(Y0,Y1)>H+60) continue;
     renderNode(child.node,cc,depth+1);
   }
 }
@@ -312,12 +343,15 @@ function rasterPixelColor(it,ix,iy){ if(!rasterOK(it)) return null;
    'edge' = a hole edge crosses the viewport, so the item is NOT a solid flat fill
             (must fall through to real geometry so the hole is visible);
    ''     = solid across the whole viewport. */
-function eraseCoverState(it,px,py,marginW){ if(!it.erases) return "";
+function eraseCoverState(it,px,py,marginW){
   let edge=false;
-  for(const e of it.erases){ const hw=e.base/2, p=e.pts;
+  if(it.erases) for(const e of it.erases){ const hw=e.base/2, p=e.pts;
     for(let i=0;i<p.length;i++){ const d=(i+1<p.length)?segDist(px,py,p[i].x,p[i].y,p[i+1].x,p[i+1].y):Math.hypot(px-p[i].x,py-p[i].y);
       if(d<=hw) return "hole";
       if(d-hw<marginW) edge=true; } }
+  if(it.holes) for(const h of it.holes){ const d=Math.hypot(px-h.x,py-h.y);
+    if(d<=h.r) return "hole";
+    if(d-h.r<marginW) edge=true; }
   return edge?"edge":"";
 }
 // undefined = item doesn't cover the viewport; null = covers but centre is see-through; string = fill colour
@@ -341,7 +375,7 @@ function coverColor(it,px,py,scale,marginW){
 function lodFillColor(){
   let px=camX,py=camY,scale=camScale,node=current; const half=Math.hypot(W,H)/2;
   for(let L=0;L<48;L++){ const marginW=half/scale;                          // half-viewport, in this node's world units
-    for(let i=node.items.length-1;i>=0;i--){ const c=coverColor(node.items[i],px,py,scale,marginW);
+    for(let i=node.items.length-1;i>=0;i--){ const it=node.items[i]; if(it.dead) continue; const c=coverColor(it,px,py,scale,marginW);
       if(c===undefined||c===null) continue;                                 // see-through / no cover: keep looking behind
       return c; }
     if(!node.up) break; const up=node.up; px=up.x+px*up.k; py=up.y+py*up.k; scale/=up.k; node=up.parent;
@@ -493,14 +527,16 @@ function applyRemove(node,it){ const i=node.items.indexOf(it); if(i>=0) node.ite
 function undo(){ const op=history.pop(); if(!op) return;
   if(op.type==="add") applyRemove(op.node,op.item);
   else if(op.type==="erase"){ for(const r of op.removed) op.node.items.splice(Math.min(r.i,op.node.items.length),0,r.item); markDirty(op.node); }
-  else if(op.type==="eraseObj"){ for(const c of op.changes){ c.item.erases=cloneErases(c.before); markDirty(c.node); } }
+  else if(op.type==="verase"){ for(const c of op.itemChanges){ c.node.items=c.before.slice(); markDirty(c.node); }
+    for(let i=op.removed.length-1;i>=0;i--){ const r=op.removed[i]; r.parent.children.splice(r.index,0,r.child); markDirty(r.parent); } }   // re-attach pruned frames
   else if(op.type==="transform"){ setGeom(op.item,op.before); markDirty(op.node); }
   else if(op.type==="items"){ op.node.items=op.before.slice(); markDirty(op.node); }
   future.push(op); updateHist(); dirty=true; }
 function redo(){ const op=future.pop(); if(!op) return;
   if(op.type==="add"){ op.node.items.push(op.item); markDirty(op.node); }
   else if(op.type==="erase"){ for(const r of [...op.removed].sort((a,b)=>b.i-a.i)){ const i=op.node.items.indexOf(r.item); if(i>=0) op.node.items.splice(i,1);} markDirty(op.node); }
-  else if(op.type==="eraseObj"){ for(const c of op.changes){ c.item.erases=cloneErases(c.after); markDirty(c.node); } }
+  else if(op.type==="verase"){ for(const c of op.itemChanges){ c.node.items=c.after.slice(); markDirty(c.node); }
+    for(const r of op.removed){ const i=r.parent.children.indexOf(r.child); if(i>=0) r.parent.children.splice(i,1); markDirty(r.parent); } }   // re-prune emptied frames
   else if(op.type==="transform"){ setGeom(op.item,op.after); markDirty(op.node); }
   else if(op.type==="items"){ op.node.items=op.after.slice(); markDirty(op.node); }
   history.push(op); updateHist(); dirty=true; }
@@ -533,11 +569,11 @@ function commitDraft(){ if(!draft) return; const d=draft; draft=null; lastW=0;
   if(d.kind==="shape"&&Math.hypot(sxNow(d.x1)-sxNow(d.x0),syNow(d.y1)-syNow(d.y0))<3){ applyRemove(current,d); return; }
   pushHist({type:"add",node:current,item:d}); }
 
-/* Pixel eraser, bound to each object: an erase drag attributes its samples to the
-   objects actually under the brush and appends them to that object's own `erases`
-   list (world-space polylines). Each object is then rendered in isolation and its
-   masks applied with destination-out, so holes belong to — and move/scale with — the
-   object. Width lives in world units, so zooming in erases arbitrarily fine detail. */
+/* Vector eraser: an erase drag deletes the geometry under the brush. Strokes lose the
+   sample points inside the brush disk and split into independent sub-strokes across the
+   gaps; shapes/images are removed whole when the brush touches them. Nothing is composited
+   per frame (so it stays fast on mobile), and once a frame is emptied it is pruned.
+   Width lives in world units, so zooming in erases arbitrarily fine detail. */
 function eraseWorldW(){ return Math.max(4,size)/camScale; }                 // eraser diameter, screen-constant, in world units
 function eraserTouches(it,ex,ey,R){                                         // does the eraser disk (world) overlap the object's painted body?
   const b=itemBounds(it);
@@ -565,40 +601,109 @@ function eraseNodes(pt){
   for(let i=0;i<ERASE_UP_CAP && node.up;i++){ const up=node.up; ex=up.x+ex*up.k; ey=up.y+ey*up.k; R*=up.k; w*=up.k; scale/=up.k; node=up.parent; }
   const out=[], stack=[{node,ex,ey,R,w,scale}];
   while(stack.length){ const d=stack.pop(); out.push(d);
-    for(const c of d.node.children){ const h=c.k/2;                        // brush disk (d.ex,d.ey,d.R) vs child frame box
-      const qx=Math.max(Math.abs(d.ex-c.x)-h,0), qy=Math.max(Math.abs(d.ey-c.y)-h,0);
-      if(qx*qx+qy*qy<=d.R*d.R){ const cs=d.scale*c.k; if(cs>=0.18)
-        stack.push({node:c.node,ex:(d.ex-c.x)/c.k,ey:(d.ey-c.y)/c.k,R:d.R/c.k,w:d.w/c.k,scale:cs}); } }
+    for(const c of d.node.children){ const cs=d.scale*c.k; if(cs<0.18) continue;   // matches the render cull, so anything visible is reachable
+      const b=bboxOf(c.node); if(!b) continue;                            // empty frame: nothing to erase (also skips work)
+      const bx0=c.x+b.x0*c.k,by0=c.y+b.y0*c.k,bx1=c.x+b.x1*c.k,by1=c.y+b.y1*c.k;   // child CONTENT box (not the unit box) in this frame's coords
+      const qx=Math.max(bx0-d.ex,d.ex-bx1,0), qy=Math.max(by0-d.ey,d.ey-by1,0);    // brush disk vs content box
+      if(qx*qx+qy*qy<=d.R*d.R) stack.push({node:c.node,ex:(d.ex-c.x)/c.k,ey:(d.ey-c.y)/c.k,R:d.R/c.k,w:d.w/c.k,scale:cs}); }
   }
   return out;
 }
-function eraseAt(node,ex,ey,R,w){                                          // attribute one brush position to the objects under it
-  for(const it of node.items){
-    if(it.kind==="erase") continue;
-    if(eraserTouches(it,ex,ey,R)){
-      let entry=eraseActive.get(it);
-      if(!entry){ if(!eraseBefore.has(it)) eraseBefore.set(it,{node,before:cloneErases(it.erases)});  // snapshot pre-drag state
-        entry={base:w,pts:[]}; if(!it.erases) it.erases=[]; it.erases.push(entry); eraseActive.set(it,entry); }
-      entry.pts.push({x:ex,y:ey,w});
-    } else eraseActive.delete(it);                                          // left the object — a re-entry starts a fresh mask (no bridging)
+function ensureSnap(node){ if(eraseSnap&&!eraseSnap.has(node)) eraseSnap.set(node,node.items.map(cloneItem)); }   // clean pre-drag copy, once per node
+function insideDisk(p,cx,cy,R){ const rr=R+(p.w||0)/2, dx=p.x-cx,dy=p.y-cy; return dx*dx+dy*dy<=rr*rr; }
+function circleSeg(ax,ay,bx,by,cx,cy,rr){                                  // where segment A->B crosses the circle: [t0,t1] clamped to [0,1], or null
+  const dx=bx-ax,dy=by-ay,fx=ax-cx,fy=ay-cy,a=dx*dx+dy*dy; if(a<1e-12) return null;
+  const b=2*(fx*dx+fy*dy),c=fx*fx+fy*fy-rr*rr; let disc=b*b-4*a*c; if(disc<0) return null; disc=Math.sqrt(disc);
+  const t0=(-b-disc)/(2*a),t1=(-b+disc)/(2*a); if(t1<0||t0>1) return null; return [t0<0?0:t0,t1>1?1:t1];
+}
+/* Cut the part of a stroke that falls inside the eraser disk, inserting points exactly on
+   the disk boundary plus a break marker in the gap. Only the ink under the brush is removed
+   — not the whole segment between sparse sample points — so it behaves like a real eraser. */
+function clipStrokeDisk(pts,cx,cy,R){
+  const out=[]; let changed=false;
+  const lerp=(a,b,t)=>({x:a.x+(b.x-a.x)*t,y:a.y+(b.y-a.y)*t,w:(a.w||0)+((b.w||0)-(a.w||0))*t});
+  const brk=()=>{ if(out.length&&!out[out.length-1].e) out.push({e:true}); };   // gap marker (skipped when drawing)
+  for(let i=0;i<pts.length;i++){
+    const A=pts[i];
+    if(A.e){ brk(); continue; }
+    const aIn=insideDisk(A,cx,cy,R);
+    if(aIn){ brk(); changed=true; } else out.push(A);
+    const B=i+1<pts.length?pts[i+1]:null; if(!B||B.e) continue;
+    const rr=R+((A.w||0)+(B.w||0))/4, seg=circleSeg(A.x,A.y,B.x,B.y,cx,cy,rr); if(!seg) continue;
+    const bIn=insideDisk(B,cx,cy,R),t0=seg[0],t1=seg[1];
+    if(!aIn&&!bIn){ if(t0>0&&t1<1){ out.push(lerp(A,B,t0)); brk(); out.push(lerp(A,B,t1)); changed=true; } }   // bite out the middle
+    else if(!aIn&&bIn){ out.push(lerp(A,B,t0)); brk(); changed=true; }                                        // cut at entry
+    else if(aIn&&!bIn){ brk(); out.push(lerp(A,B,t1)); changed=true; }                                        // cut at exit
   }
+  return changed?out:null;
+}
+/* One brush position on a stroke. If the eraser disk is at least as wide as the line is
+   thick (R >= half-width) it severs the line — clip the centre geometry out (splitting the
+   stroke, so fully-erased pieces vanish). If it's smaller (a small eraser on a thick line)
+   it can't cut through, so we punch a masked hole in the body instead. Holes are bounded:
+   consecutive stamps closer than R/2 are skipped. */
+function eraseAt(node,ex,ey,R){
+  let touched=false;
+  for(const it of node.items){
+    if(it.dead) continue;
+    if(it.kind==="stroke"){
+      const b=itemBounds(it);
+      if(ex<b.x0-R||ex>b.x1+R||ey<b.y0-R||ey>b.y1+R) continue;             // broad phase
+      const hw=(it.base||0)/2*(it.mode==="marker"?2.2:1);                  // visual half-width (markers render wider)
+      if(R>=hw){                                                           // cut clean through
+        const np=clipStrokeDisk(it.pts,ex,ey,R);
+        if(np){ ensureSnap(node); it.pts=np; it.bb=undefined; touched=true; }
+      } else {                                                             // punch a hole in the body
+        if(!it.holes) it.holes=[]; const last=it.holes[it.holes.length-1];
+        if(!last||Math.hypot(ex-last.x,ey-last.y)>R*0.5){ ensureSnap(node); it.holes.push({x:ex,y:ey,r:R}); touched=true; }
+      }
+    } else if(eraserTouches(it,ex,ey,R)){ ensureSnap(node); it.dead=true; touched=true; }
+  }
+  if(touched) markDirty(node);
 }
 function eraseSample(pt){
   for(const t of eraseNodes(pt)){
     const last=eraseLast&&eraseLast.get(t.node);                            // interpolate along the drag so fast strokes don't skip past thin lines
     if(last){ const dx=t.ex-last.ex,dy=t.ey-last.ey,dist=Math.hypot(dx,dy);
-      const n=Math.min(256,Math.max(1,Math.ceil(dist/Math.max(t.R,1e-6))));
-      for(let i=1;i<=n;i++){ const f=i/n; eraseAt(t.node,last.ex+dx*f,last.ey+dy*f,t.R,t.w); } }
-    else eraseAt(t.node,t.ex,t.ey,t.R,t.w);
+      const n=Math.min(64,Math.max(1,Math.ceil(dist/Math.max(t.R,1e-6))));
+      for(let i=1;i<=n;i++){ const f=i/n; eraseAt(t.node,last.ex+dx*f,last.ey+dy*f,t.R); } }
+    else eraseAt(t.node,t.ex,t.ey,t.R);
     if(eraseLast) eraseLast.set(t.node,{ex:t.ex,ey:t.ey});
-    markDirty(t.node);
   }
   dirty=true;
 }
-function commitErase(){ if(eraseBefore&&eraseBefore.size){ const changes=[];
-    for(const [it,rec] of eraseBefore) changes.push({item:it,node:rec.node,before:rec.before,after:cloneErases(it.erases)});
-    pushHist({type:"eraseObj",changes}); }
-  eraseActive=eraseBefore=eraseLast=null; }
+/* Turn a stroke whose points carry `e` flags into the surviving runs (independent strokes);
+   lone leftover points from a split are dropped so erasing doesn't leave stray dots. */
+function splitStroke(it){
+  const runs=[]; let cur=null;
+  for(const p of it.pts){ if(p.e){ cur=null; } else { if(!cur){ cur=[]; runs.push(cur); } cur.push({x:p.x,y:p.y,w:p.w}); } }
+  const hw=(it.base||0)/2;
+  return runs.filter(r=>r.length>1).map(r=>{
+    const s={kind:"stroke",mode:it.mode,color:it.color,alpha:it.alpha,base:it.base,pts:r,bb:undefined};
+    if(it.holes&&it.holes.length){ const bb=strokeBB(s);                    // keep only the holes that touch this piece — don't copy every hole onto every split
+      const hs=it.holes.filter(h=>h.x+h.r>=bb.x0-hw&&h.x-h.r<=bb.x1+hw&&h.y+h.r>=bb.y0-hw&&h.y-h.r<=bb.y1+hw);
+      if(hs.length) s.holes=hs.map(h=>({x:h.x,y:h.y,r:h.r})); }
+    return s;
+  });
+}
+function commitErase(){
+  if(eraseSnap&&eraseSnap.size){
+    const itemChanges=[];
+    for(const [node,before] of eraseSnap){
+      const after=[];
+      for(const it of node.items){
+        if(it.dead) continue;
+        if(it.kind==="stroke"&&it.pts.some(p=>p.e)){ for(const s of splitStroke(it)) after.push(s); }
+        else after.push(it);
+      }
+      node.items=after; markDirty(node);
+      itemChanges.push({node,before,after:after.map(cloneItem)});
+    }
+    const removed=detachEmptyFrames();
+    pushHist({type:"verase",itemChanges,removed});
+  }
+  eraseSnap=eraseLast=null;
+}
 function hitItem(it,px,py,R){
   if(it.kind==="stroke"){ for(const q of it.pts){ const dx=sxNow(q.x)-px,dy=syNow(q.y)-py; if(dx*dx+dy*dy<=R*R) return true; } return false; }
   if(it.kind==="raster"){ const x=sxNow(it.x),y=syNow(it.y),w=(it.src.width||1)*it.s*camScale,h=(it.src.height||1)*it.s*camScale; return px>=x-R&&px<=x+w+R&&py>=y-R&&py<=y+h+R; }
@@ -612,18 +717,25 @@ function pickItem(px,py){ const R=Math.max(10,(6)); for(let i=current.items.leng
 
 /* ---------------- select / move / resize ---------------- */
 function cloneErases(er){ return er?er.map(e=>({base:e.base,pts:e.pts.map(p=>({x:p.x,y:p.y,w:p.w}))})):undefined; }
+function cloneHoles(h){ return h&&h.length?h.map(o=>({x:o.x,y:o.y,r:o.r})):undefined; }   // erase holes: world-space circle stamps
+function cloneItem(it){                                                     // deep copy of an item's geometry (image src shared); no transient erase flags
+  if(it.kind==="raster") return {kind:"raster",x:it.x,y:it.y,s:it.s,alpha:it.alpha,src:it.src,erases:cloneErases(it.erases)};
+  if(it.kind==="shape") return {kind:"shape",shape:it.shape,color:it.color,alpha:it.alpha,base:it.base,x0:it.x0,y0:it.y0,x1:it.x1,y1:it.y1,erases:cloneErases(it.erases)};
+  return {kind:"stroke",mode:it.mode,color:it.color,alpha:it.alpha,base:it.base,pts:it.pts.map(p=>({x:p.x,y:p.y,w:p.w})),erases:cloneErases(it.erases),holes:cloneHoles(it.holes),bb:undefined};
+}
 function geomOf(it){ const er=cloneErases(it.erases);
   if(it.kind==="raster")return{x:it.x,y:it.y,s:it.s,erases:er};
   if(it.kind==="shape")return{x0:it.x0,y0:it.y0,x1:it.x1,y1:it.y1,base:it.base,erases:er};
-  return{base:it.base,pts:it.pts.map(p=>({x:p.x,y:p.y,w:p.w})),erases:er}; }
-function setGeom(it,g){ if(it.kind==="raster"){it.x=g.x;it.y=g.y;it.s=g.s;} else if(it.kind==="shape"){it.x0=g.x0;it.y0=g.y0;it.x1=g.x1;it.y1=g.y1;it.base=g.base;} else {it.base=g.base; it.pts=g.pts.map(p=>({x:p.x,y:p.y,w:p.w})); it.bb=undefined;}
+  return{base:it.base,pts:it.pts.map(p=>({x:p.x,y:p.y,w:p.w})),erases:er,holes:cloneHoles(it.holes)}; }
+function setGeom(it,g){ if(it.kind==="raster"){it.x=g.x;it.y=g.y;it.s=g.s;} else if(it.kind==="shape"){it.x0=g.x0;it.y0=g.y0;it.x1=g.x1;it.y1=g.y1;it.base=g.base;} else {it.base=g.base; it.pts=g.pts.map(p=>({x:p.x,y:p.y,w:p.w})); it.holes=cloneHoles(g.holes); it.bb=undefined;}
   it.erases=cloneErases(g.erases); }
-function translateItem(it,dx,dy){ if(it.kind==="raster"){it.x+=dx;it.y+=dy;} else if(it.kind==="shape"){it.x0+=dx;it.y0+=dy;it.x1+=dx;it.y1+=dy;} else { for(const p of it.pts){p.x+=dx;p.y+=dy;} it.bb=undefined; }
+function translateItem(it,dx,dy){ if(it.kind==="raster"){it.x+=dx;it.y+=dy;} else if(it.kind==="shape"){it.x0+=dx;it.y0+=dy;it.x1+=dx;it.y1+=dy;} else { for(const p of it.pts){p.x+=dx;p.y+=dy;} if(it.holes) for(const h of it.holes){ h.x+=dx; h.y+=dy; } it.bb=undefined; }
   if(it.erases) for(const e of it.erases) for(const p of e.pts){ p.x+=dx; p.y+=dy; } }
 function scaleFromSnap(it,snap,pvx,pvy,f){
   if(it.kind==="raster"){ it.x=pvx+(snap.x-pvx)*f; it.y=pvy+(snap.y-pvy)*f; it.s=snap.s*f; }
   else if(it.kind==="shape"){ it.x0=pvx+(snap.x0-pvx)*f; it.y0=pvy+(snap.y0-pvy)*f; it.x1=pvx+(snap.x1-pvx)*f; it.y1=pvy+(snap.y1-pvy)*f; it.base=snap.base*f; }
-  else { it.base=snap.base*f; it.pts=snap.pts.map(p=>({x:pvx+(p.x-pvx)*f,y:pvy+(p.y-pvy)*f,w:p.w*f})); it.bb=undefined; }
+  else { it.base=snap.base*f; it.pts=snap.pts.map(p=>({x:pvx+(p.x-pvx)*f,y:pvy+(p.y-pvy)*f,w:p.w*f})); it.bb=undefined;
+    it.holes=snap.holes?snap.holes.map(h=>({x:pvx+(h.x-pvx)*f,y:pvy+(h.y-pvy)*f,r:h.r*f})):undefined; }
   it.erases=snap.erases?snap.erases.map(e=>({base:e.base*f,pts:e.pts.map(p=>({x:pvx+(p.x-pvx)*f,y:pvy+(p.y-pvy)*f,w:p.w*f}))})):undefined;
 }
 function selectPointerDown(p){
@@ -659,10 +771,11 @@ fileInput.addEventListener("change",()=>{ const f=fileInput.files&&fileInput.fil
 
 /* ---------------- export / import ---------------- */
 function serErases(it){ return it.erases&&it.erases.length?{erases:it.erases.map(e=>({base:e.base,pts:e.pts.map(p=>({x:p.x,y:p.y,w:p.w}))}))}:null; }
+function serHoles(it){ return it.holes&&it.holes.length?{holes:it.holes.map(h=>({x:h.x,y:h.y,r:h.r}))}:null; }
 function serItem(it){ if(it.kind==="raster"){ let data=""; try{ if(it.src.toDataURL) data=it.src.toDataURL("image/png"); else { const cv=document.createElement("canvas"); cv.width=it.src.width; cv.height=it.src.height; cv.getContext("2d").drawImage(it.src,0,0); data=cv.toDataURL("image/png"); } }catch(e){}
     return {kind:"raster",x:it.x,y:it.y,s:it.s,alpha:it.alpha,data,...serErases(it)}; }
   if(it.kind==="shape") return {kind:"shape",shape:it.shape,color:it.color,alpha:it.alpha,base:it.base,x0:it.x0,y0:it.y0,x1:it.x1,y1:it.y1,...serErases(it)};
-  return {kind:"stroke",mode:it.mode,color:it.color,alpha:it.alpha,base:it.base,pts:it.pts.map(p=>({x:p.x,y:p.y,w:p.w})),...serErases(it)}; }
+  return {kind:"stroke",mode:it.mode,color:it.color,alpha:it.alpha,base:it.base,pts:it.pts.map(p=>({x:p.x,y:p.y,w:p.w})),...serErases(it),...serHoles(it)}; }
 function serNode(n){ return {items:n.items.map(serItem), children:n.children.map(c=>({x:c.x,y:c.y,k:c.k,node:serNode(c.node)}))}; }
 function download(name,blob){ const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download=name; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1500); }
 function pathToCurrent(){ const p=[]; let n=current; while(n.up){ const ch=n.up, idx=ch.parent.children.indexOf(ch); p.push(idx); n=ch.parent; } return p.reverse(); }
@@ -707,7 +820,7 @@ canvas.addEventListener("pointerdown",e=>{
   if(wantPan){ mode="pan"; panLast=p; setCursor(); return; }
   if(tool==="pen"||tool==="brush"||tool==="marker"){ mode="draw"; lastMoveT=performance.now(); lastW=0; startStroke(p,tool,e); }
   else if(tool==="line"||tool==="rect"||tool==="ellipse"){ mode="shape"; startShape(p,tool); }
-  else if(tool==="eraser"){ mode="erase"; eraseActive=new Map(); eraseBefore=new Map(); eraseLast=new Map(); eraseSample(p); }
+  else if(tool==="eraser"){ mode="erase"; eraseSnap=new Map(); eraseLast=new Map(); eraseSample(p); }
   else if(tool==="select"){ selectPointerDown(p); }
   else if(tool==="image"){ if(pendingImage){ mode="placeimg"; placeAnchor=p; previewRect={x:p.x,y:p.y,w:0,h:0}; } else { fileInput.value=""; fileInput.click(); } }
 });
