@@ -435,7 +435,7 @@ canvas.addEventListener("pointerdown",e=>{
   canvas.setPointerCapture(e.pointerId); const p=local(e); pointers.set(e.pointerId,p); cursor=p; stopMomentum();
   mvVel={x:0,y:0}; mvLast={x:p.x,y:p.y,t:performance.now()};
   if(pointers.size===2){ if(draft){applyRemove(current,draft);draft=null;} eraseSnap=null; eraseNode=null; mode="pinch";
-    const[a,b]=[...pointers.values()]; pinchStart={dist:Math.hypot(a.x-b.x,a.y-b.y),cx:(a.x+b.x)/2,cy:(a.y+b.y)/2}; dirty=true; return; }
+    const[a,b]=[...pointers.values()]; pinchStart={dist:Math.hypot(a.x-b.x,a.y-b.y),cx:(a.x+b.x)/2,cy:(a.y+b.y)/2,_t:performance.now()}; dirty=true; return; }
   const wantPan=tool==="hand"||spaceHeld||e.button===1||e.button===2;
   if(wantPan){ mode="pan"; panLast=p; setCursor(); return; }
   if(tool==="pen"||tool==="brush"||tool==="marker"){ mode="draw"; lastMoveT=performance.now(); lastW=0; startStroke(p,tool,e); }
@@ -446,13 +446,15 @@ canvas.addEventListener("pointerdown",e=>{
 });
 canvas.addEventListener("pointermove",e=>{
   const p=local(e); cursor=p;
-  if(mvLast){ const now=performance.now(),dt=Math.max(8,now-mvLast.t)/1000; mvVel.x=mvVel.x*0.6+((p.x-mvLast.x)/dt)*0.4; mvVel.y=mvVel.y*0.6+((p.y-mvLast.y)/dt)*0.4; mvLast={x:p.x,y:p.y,t:now}; }
+  if(mvLast&&pointers.size<2){ const now=performance.now(),dt=Math.max(8,now-mvLast.t)/1000; mvVel.x=mvVel.x*0.6+((p.x-mvLast.x)/dt)*0.4; mvVel.y=mvVel.y*0.6+((p.y-mvLast.y)/dt)*0.4; mvLast={x:p.x,y:p.y,t:now}; }
   if(!pointers.has(e.pointerId)){ dirty=true; return; }
   pointers.set(e.pointerId,p);
   if(mode==="pinch"&&pointers.size>=2){
     const[a,b]=[...pointers.values()]; const dist=Math.hypot(a.x-b.x,a.y-b.y),cx=(a.x+b.x)/2,cy=(a.y+b.y)/2;
     if(pinchStart.dist>0){ let ratio=Math.max(.2,Math.min(5,dist/pinchStart.dist)); const awx=wX(cx),awy=wY(cy); camScale*=ratio; camX=awx-(cx-W/2)/camScale; camY=awy-(cy-H/2)/camScale; }
-    camX-=(cx-pinchStart.cx)/camScale; camY-=(cy-pinchStart.cy)/camScale; pinchStart={dist,cx,cy}; targetScale=camScale; reframe(); dirty=true;
+    camX-=(cx-pinchStart.cx)/camScale; camY-=(cy-pinchStart.cy)/camScale;
+    const nowp=performance.now(); if(pinchStart._t){ const dt=Math.max(8,nowp-pinchStart._t)/1000; mvVel.x=mvVel.x*0.6+((cx-pinchStart.cx)/dt)*0.4; mvVel.y=mvVel.y*0.6+((cy-pinchStart.cy)/dt)*0.4; }
+    pinchStart={dist,cx,cy,_t:nowp}; targetScale=camScale; reframe(); dirty=true;
   }else if(mode==="pan"&&panLast){ camX-=(p.x-panLast.x)/camScale; camY-=(p.y-panLast.y)/camScale; panLast=p; dirty=true; }
   else if(mode==="draw"){ const evs=e.getCoalescedEvents?e.getCoalescedEvents():null; if(evs&&evs.length){ for(const ev of evs) extendStroke(local(ev),ev); } else extendStroke(p,e); }
   else if(mode==="shape"){ extendShape(p); }
@@ -468,7 +470,7 @@ function release(e){
   else if(mode==="erase"){ if(eraseNode&&eraseSnap){ const a=eraseSnap,b=eraseNode.items; let diff=a.length!==b.length; if(!diff) for(let i=0;i<a.length;i++){ if(a[i]!==b[i]){diff=true;break;} } if(diff) pushHist({type:"items",node:eraseNode,before:eraseSnap,after:eraseNode.items.slice()}); } eraseSnap=null; eraseNode=null; erasePrev=null; mode=null; }
   else if(mode==="move"||mode==="resize"){ endTransform(); mode=null; }
   else if(mode==="placeimg"){ placeImage(previewRect||{x:cursor.x,y:cursor.y,w:0,h:0}); placeAnchor=null; mode=null; }
-  else if(mode==="pinch"){ if(pointers.size===1){ mode="pan"; panLast=[...pointers.values()][0]; } else if(pointers.size===0){ mode=null; pVel={x:mvVel.x,y:mvVel.y}; } }
+  else if(mode==="pinch"){ if(pointers.size===1){ mode="pan"; panLast=[...pointers.values()][0]; mvLast={x:panLast.x,y:panLast.y,t:performance.now()}; } else if(pointers.size===0){ mode=null; pVel={x:mvVel.x,y:mvVel.y}; } }
   else if(mode==="pan"){ if(pointers.size===0){ mode=null; panLast=null; pVel={x:mvVel.x,y:mvVel.y}; } }
   setCursor(); dirty=true;
 }
