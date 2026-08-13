@@ -13,10 +13,20 @@
     -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;overscroll-behavior:none;touch-action:none}
   #c{display:block;position:fixed;inset:0;touch-action:none}
 
-  .bar{position:fixed;top:14px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:5px;
+  .bar{position:fixed;display:flex;align-items:center;gap:5px;
     padding:7px;background:color-mix(in srgb,var(--bar) 92%,transparent);backdrop-filter:blur(10px) saturate(1.2);
     border:1px solid var(--bar-edge);border-radius:16px;box-shadow:0 8px 30px rgba(20,22,28,.28);z-index:10;
-    max-width:calc(100vw - 20px);flex-wrap:wrap;justify-content:center}
+    flex-wrap:wrap;justify-content:center}
+  .bar.dock-top{top:14px;left:50%;transform:translateX(-50%);flex-direction:row;max-width:calc(100vw - 20px)}
+  .bar.dock-bottom{bottom:14px;left:50%;transform:translateX(-50%);flex-direction:row;max-width:calc(100vw - 20px)}
+  .bar.dock-left{left:14px;top:50%;transform:translateY(-50%);flex-direction:column;max-height:calc(100vh - 20px)}
+  .bar.dock-right{right:14px;top:50%;transform:translateY(-50%);flex-direction:column;max-height:calc(100vh - 20px)}
+  .bar.dock-left .sep,.bar.dock-right .sep{width:auto;height:1px;align-self:stretch;margin:3px 4px}
+  .bar.dragging{opacity:.92}
+  .grip{cursor:grab;color:var(--muted);touch-action:none}
+  .grip:active{cursor:grabbing}
+  .grip:hover{background:rgba(255,255,255,.06);color:var(--text)}
+  .grip svg{width:16px;height:16px}
   .sep{width:1px;align-self:stretch;margin:2px 3px;background:var(--bar-edge)}
   .btn{appearance:none;border:0;cursor:pointer;height:40px;min-width:40px;padding:0 9px;display:inline-flex;
     align-items:center;justify-content:center;gap:6px;background:transparent;color:var(--muted);border-radius:11px;
@@ -65,7 +75,8 @@
 
 <button class="showtools" id="showTools" title="Show tools (Tab)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg></button>
 
-<div class="bar" id="bar">
+<div class="bar dock-top" id="bar">
+  <button class="btn grip" id="barGrip" title="Drag to move toolbar to any edge"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></button>
   <button class="btn active" data-tool="pen" title="Pen (P)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19l7-7-4-4-7 7-1 5z"/><path d="M15 8l1 1"/></svg></button>
   <button class="btn" data-tool="brush" title="Brush — pressure sensitive (B)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20c2-1 3-3 3-5"/><path d="M14 4l6 6-8 6-4-4z"/></svg></button>
   <button class="btn" data-tool="marker" title="Highlighter (M)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l4-7 6 3-4 7"/><path d="M9 11l-2 6 4 2 4-4"/><path d="M5 21h6"/></svg></button>
@@ -111,6 +122,7 @@
   <span class="sep"></span>
   <button class="btn" id="exportBtn" title="Export drawing (.json)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m8 11 4 4 4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg></button>
   <button class="btn" id="importBtn" title="Import drawing (.json)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3"/><path d="m8 7 4-4 4 4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg></button>
+  <button class="btn" id="fsBtn" title="Fullscreen (F)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M16 3h3a2 2 0 0 1 2 2v3"/><path d="M8 21H5a2 2 0 0 1-2-2v-3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg></button>
   <button class="btn" id="hideBtn" title="Hide toolbar (Tab)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></button>
 </div>
 
@@ -143,7 +155,7 @@ let bgColor=null;   // canvas background colour; null = default CSS paper gradie
 /* ---------------- input / physics ---------------- */
 const pointers=new Map();
 let mode=null, panLast=null, pinchStart=null, spaceHeld=false, cursor=null;
-let draft=null, eraseActive=null, eraseBefore=null;
+let draft=null, eraseActive=null, eraseBefore=null, eraseLast=null;
 let pendingImage=null, placeAnchor=null, previewRect=null;
 let selected=null, dragLast=null, resizeInfo=null, transformSnap=null;
 let dirty=true;
@@ -192,23 +204,27 @@ function bboxOf(node){
 
 /* ---------------- rendering ---------------- */
 const nSX=(cam,x)=>(x-cam.x)*cam.scale+W/2, nSY=(cam,y)=>(y-cam.y)*cam.scale+H/2;
+/* A stroke/dab wider than a couple of viewports looks identical once it covers the
+   screen, but feeding the rasterizer an enormous (or fly-to-transient near-infinite)
+   width/radius can hang it — so we clamp draw widths without a size-based content cull. */
+const capPx=v=>{ const m=(W+H)*2; return v>m?m:v; };
 /* Item drawing targets `g` — normally the main ctx, but the offscreen layer while
    an object is being rendered in isolation so its erase mask affects only itself. */
 function drawStrokeItem(it,cam){
   const p=it.pts;
   if(it.mode==="brush"){
     g.fillStyle=it.color;
-    if(p.length===1){ g.beginPath(); g.arc(nSX(cam,p[0].x),nSY(cam,p[0].y),Math.max(.4,p[0].w*cam.scale/2),0,6.2832); g.fill(); return; }
+    if(p.length===1){ g.beginPath(); g.arc(nSX(cam,p[0].x),nSY(cam,p[0].y),capPx(Math.max(.4,p[0].w*cam.scale/2)),0,6.2832); g.fill(); return; }
     for(let i=0;i<p.length-1;i++){
       const ax=nSX(cam,p[i].x),ay=nSY(cam,p[i].y),bx=nSX(cam,p[i+1].x),by=nSY(cam,p[i+1].y);
-      const ra=Math.max(.4,p[i].w*cam.scale/2), rb=Math.max(.4,p[i+1].w*cam.scale/2);
+      const ra=capPx(Math.max(.4,p[i].w*cam.scale/2)), rb=capPx(Math.max(.4,p[i+1].w*cam.scale/2));
       const dx=bx-ax,dy=by-ay,len=Math.hypot(dx,dy)||1, nx=-dy/len, ny=dx/len;
       g.beginPath(); g.moveTo(ax+nx*ra,ay+ny*ra); g.lineTo(bx+nx*rb,by+ny*rb); g.lineTo(bx-nx*rb,by-ny*rb); g.lineTo(ax-nx*ra,ay-ny*ra); g.closePath(); g.fill();
       g.beginPath(); g.arc(bx,by,rb,0,6.2832); g.fill();
     }
-    g.beginPath(); g.arc(nSX(cam,p[0].x),nSY(cam,p[0].y),Math.max(.4,p[0].w*cam.scale/2),0,6.2832); g.fill(); return;
+    g.beginPath(); g.arc(nSX(cam,p[0].x),nSY(cam,p[0].y),capPx(Math.max(.4,p[0].w*cam.scale/2)),0,6.2832); g.fill(); return;
   }
-  const lw=Math.max(.4,it.base*cam.scale*(it.mode==="marker"?2.2:1));
+  const lw=capPx(Math.max(.4,it.base*cam.scale*(it.mode==="marker"?2.2:1)));
   g.strokeStyle=it.color; g.lineWidth=lw; g.lineCap="round"; g.lineJoin="round";
   if(p.length===1){ g.fillStyle=it.color; g.beginPath(); g.arc(nSX(cam,p[0].x),nSY(cam,p[0].y),lw/2,0,6.2832); g.fill(); return; }
   g.beginPath(); g.moveTo(nSX(cam,p[0].x),nSY(cam,p[0].y));
@@ -217,7 +233,7 @@ function drawStrokeItem(it,cam){
 }
 function drawShapeItem(it,cam){
   const x0=nSX(cam,it.x0),y0=nSY(cam,it.y0),x1=nSX(cam,it.x1),y1=nSY(cam,it.y1);
-  g.strokeStyle=it.color; g.lineWidth=Math.max(.4,it.base*cam.scale); g.lineCap="round"; g.lineJoin="round"; g.beginPath();
+  g.strokeStyle=it.color; g.lineWidth=capPx(Math.max(.4,it.base*cam.scale)); g.lineCap="round"; g.lineJoin="round"; g.beginPath();
   if(it.shape==="line"){ g.moveTo(x0,y0); g.lineTo(x1,y1); }
   else if(it.shape==="rect"){ g.rect(Math.min(x0,x1),Math.min(y0,y1),Math.abs(x1-x0),Math.abs(y1-y0)); }
   else { g.ellipse((x0+x1)/2,(y0+y1)/2,Math.abs(x1-x0)/2,Math.abs(y1-y0)/2,0,0,6.2832); }
@@ -227,7 +243,7 @@ function drawRasterItem(it,cam){ if(!rasterOK(it)) return; const x=nSX(cam,it.x)
 function drawEraseMask(e,cam){                                              // one erase polyline, punched via destination-out on `g`
   const p=e.pts; if(!p.length) return;
   g.save(); g.globalCompositeOperation="destination-out"; g.globalAlpha=1; g.fillStyle=g.strokeStyle="#000";
-  const lw=Math.max(1,e.base*cam.scale);
+  const lw=capPx(Math.max(1,e.base*cam.scale));
   if(p.length===1){ g.beginPath(); g.arc(nSX(cam,p[0].x),nSY(cam,p[0].y),lw/2,0,6.2832); g.fill(); }
   else { g.lineWidth=lw; g.lineCap="round"; g.lineJoin="round"; g.beginPath(); g.moveTo(nSX(cam,p[0].x),nSY(cam,p[0].y));
     for(let i=1;i<p.length;i++) g.lineTo(nSX(cam,p[i].x),nSY(cam,p[i].y)); g.stroke(); }
@@ -244,10 +260,10 @@ function itemScreenRect(it,cam){                                            // p
   return {x:rx,y:ry,w:rr-rx,h:rb-ry};
 }
 function drawItems(node,cam){
-  const drawCap=(W+H)*12;                                                  // safety cap: astronomically large geometry (transient during a fly-to between distant depths) would hang the GPU/compositor
+  const hangCap=5e6;                                                       // NOT a visible clip plane: only rejects non-finite / astronomically large spans (transient fly-to spikes between distant depths). Real deep-zoom content always renders.
   for(const it of node.items){
     const ib=itemBounds(it);
-    if(Math.max(ib.x1-ib.x0,ib.y1-ib.y0)*cam.scale>drawCap) continue;      // too big to rasterize safely — LOD background fill already covers screen-wide coverage
+    if(!(Math.max(ib.x1-ib.x0,ib.y1-ib.y0)*cam.scale<hangCap)) continue;   // NaN/Infinity or absurd size would hang the rasterizer; LOD background fill still covers screen-wide coverage
     if(!it.erases||!it.erases.length){                                     // fast path: no mask, draw straight to main ctx
       g=ctx; ctx.globalAlpha=it.alpha!=null?it.alpha:1; drawOneItem(it,cam); continue;
     }
@@ -291,11 +307,18 @@ function rasterPixelColor(it,ix,iy){ if(!rasterOK(it)) return null;
   px1ctx.clearRect(0,0,1,1); try{ px1ctx.drawImage(it.src,ix,iy,1,1,0,0,1,1); }catch(e){ return null; }
   const d=px1ctx.getImageData(0,0,1,1).data; return d[3]<8?null:`rgb(${d[0]},${d[1]},${d[2]})`;
 }
-function inErasedHole(it,px,py){ if(!it.erases) return false;
+/* State of a covering item's erase holes relative to the viewport centre:
+   'hole' = centre sits inside a hole (see-through);
+   'edge' = a hole edge crosses the viewport, so the item is NOT a solid flat fill
+            (must fall through to real geometry so the hole is visible);
+   ''     = solid across the whole viewport. */
+function eraseCoverState(it,px,py,marginW){ if(!it.erases) return "";
+  let edge=false;
   for(const e of it.erases){ const hw=e.base/2, p=e.pts;
     for(let i=0;i<p.length;i++){ const d=(i+1<p.length)?segDist(px,py,p[i].x,p[i].y,p[i+1].x,p[i+1].y):Math.hypot(px-p[i].x,py-p[i].y);
-      if(d<=hw) return true; } }
-  return false;
+      if(d<=hw) return "hole";
+      if(d-hw<marginW) edge=true; } }
+  return edge?"edge":"";
 }
 // undefined = item doesn't cover the viewport; null = covers but centre is see-through; string = fill colour
 function coverColor(it,px,py,scale,marginW){
@@ -305,11 +328,12 @@ function coverColor(it,px,py,scale,marginW){
         for(let i=0;i<p.length;i++){ const dd=(i+1<p.length)?segDist(px,py,p[i].x,p[i].y,p[i+1].x,p[i+1].y):Math.hypot(px-p[i].x,py-p[i].y); if(dd<d)d=dd; } }
       else d=segDist(px,py,it.x0,it.y0,it.x1,it.y1);
     if(d+marginW>it.base/2) return undefined;                               // viewport not wholly inside the stroke body
-    return inErasedHole(it,px,py)?null:it.color;
+    const st=eraseCoverState(it,px,py,marginW); if(st==="hole") return null; if(st==="edge") return undefined;
+    return it.color;
   }
   if(it.kind==="raster"){ const b=itemBounds(it);
     if(px-b.x0<marginW||b.x1-px<marginW||py-b.y0<marginW||b.y1-py<marginW) return undefined;   // viewport not wholly inside image
-    if(inErasedHole(it,px,py)) return null;
+    const st=eraseCoverState(it,px,py,marginW); if(st==="hole") return null; if(st==="edge") return undefined;
     return rasterPixelColor(it,Math.floor((px-it.x)/it.s),Math.floor((py-it.y)/it.s));
   }
   return undefined;                                                         // rect/ellipse outlines: no LOD fill
@@ -548,17 +572,25 @@ function eraseNodes(pt){
   }
   return out;
 }
+function eraseAt(node,ex,ey,R,w){                                          // attribute one brush position to the objects under it
+  for(const it of node.items){
+    if(it.kind==="erase") continue;
+    if(eraserTouches(it,ex,ey,R)){
+      let entry=eraseActive.get(it);
+      if(!entry){ if(!eraseBefore.has(it)) eraseBefore.set(it,{node,before:cloneErases(it.erases)});  // snapshot pre-drag state
+        entry={base:w,pts:[]}; if(!it.erases) it.erases=[]; it.erases.push(entry); eraseActive.set(it,entry); }
+      entry.pts.push({x:ex,y:ey,w});
+    } else eraseActive.delete(it);                                          // left the object — a re-entry starts a fresh mask (no bridging)
+  }
+}
 function eraseSample(pt){
   for(const t of eraseNodes(pt)){
-    for(const it of t.node.items){
-      if(it.kind==="erase") continue;
-      if(eraserTouches(it,t.ex,t.ey,t.R)){
-        let entry=eraseActive.get(it);
-        if(!entry){ if(!eraseBefore.has(it)) eraseBefore.set(it,{node:t.node,before:cloneErases(it.erases)});  // snapshot pre-drag state
-          entry={base:t.w,pts:[]}; if(!it.erases) it.erases=[]; it.erases.push(entry); eraseActive.set(it,entry); }
-        entry.pts.push({x:t.ex,y:t.ey,w:t.w});
-      } else eraseActive.delete(it);                                        // left the object — a re-entry starts a fresh mask (no bridging)
-    }
+    const last=eraseLast&&eraseLast.get(t.node);                            // interpolate along the drag so fast strokes don't skip past thin lines
+    if(last){ const dx=t.ex-last.ex,dy=t.ey-last.ey,dist=Math.hypot(dx,dy);
+      const n=Math.min(256,Math.max(1,Math.ceil(dist/Math.max(t.R,1e-6))));
+      for(let i=1;i<=n;i++){ const f=i/n; eraseAt(t.node,last.ex+dx*f,last.ey+dy*f,t.R,t.w); } }
+    else eraseAt(t.node,t.ex,t.ey,t.R,t.w);
+    if(eraseLast) eraseLast.set(t.node,{ex:t.ex,ey:t.ey});
     markDirty(t.node);
   }
   dirty=true;
@@ -566,7 +598,7 @@ function eraseSample(pt){
 function commitErase(){ if(eraseBefore&&eraseBefore.size){ const changes=[];
     for(const [it,rec] of eraseBefore) changes.push({item:it,node:rec.node,before:rec.before,after:cloneErases(it.erases)});
     pushHist({type:"eraseObj",changes}); }
-  eraseActive=eraseBefore=null; }
+  eraseActive=eraseBefore=eraseLast=null; }
 function hitItem(it,px,py,R){
   if(it.kind==="stroke"){ for(const q of it.pts){ const dx=sxNow(q.x)-px,dy=syNow(q.y)-py; if(dx*dx+dy*dy<=R*R) return true; } return false; }
   if(it.kind==="raster"){ const x=sxNow(it.x),y=syNow(it.y),w=(it.src.width||1)*it.s*camScale,h=(it.src.height||1)*it.s*camScale; return px>=x-R&&px<=x+w+R&&py>=y-R&&py<=y+h+R; }
@@ -675,7 +707,7 @@ canvas.addEventListener("pointerdown",e=>{
   if(wantPan){ mode="pan"; panLast=p; setCursor(); return; }
   if(tool==="pen"||tool==="brush"||tool==="marker"){ mode="draw"; lastMoveT=performance.now(); lastW=0; startStroke(p,tool,e); }
   else if(tool==="line"||tool==="rect"||tool==="ellipse"){ mode="shape"; startShape(p,tool); }
-  else if(tool==="eraser"){ mode="erase"; eraseActive=new Map(); eraseBefore=new Map(); eraseSample(p); }
+  else if(tool==="eraser"){ mode="erase"; eraseActive=new Map(); eraseBefore=new Map(); eraseLast=new Map(); eraseSample(p); }
   else if(tool==="select"){ selectPointerDown(p); }
   else if(tool==="image"){ if(pendingImage){ mode="placeimg"; placeAnchor=p; previewRect={x:p.x,y:p.y,w:0,h:0}; } else { fileInput.value=""; fileInput.click(); } }
 });
@@ -731,6 +763,7 @@ addEventListener("keydown",e=>{
   if((e.key==="Delete"||e.key==="Backspace")&&selected){ e.preventDefault(); deleteSelected(); return; }
   const k=e.key.toLowerCase(), map={p:"pen",b:"brush",m:"marker",l:"line",r:"rect",o:"ellipse",v:"select",e:"eraser",h:"hand",g:"loupe"};
   if(k==="i"){ document.getElementById("imgBtn").click(); }
+  else if(k==="f"){ toggleFullscreen(); }
   else if(map[k]) setTool(map[k]);
   else if(k==="="||k==="+")zoomAction(1.3); else if(k==="-"||k==="_")zoomAction(1/1.3);
 });
@@ -744,6 +777,32 @@ document.querySelectorAll("[data-tool]").forEach(b=>{ if(b.id==="imgBtn") return
 let uiHidden=false;
 function toggleUI(){ uiHidden=!uiHidden; bar.style.display=uiHidden?"none":"flex"; showTools.style.display=uiHidden?"flex":"none"; }
 document.getElementById("hideBtn").onclick=toggleUI; showTools.onclick=toggleUI;
+
+/* Fullscreen toggle — swaps the icon between "expand" and "collapse" as state changes. */
+const fsBtn=document.getElementById("fsBtn");
+const FS_EXPAND='<path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M16 3h3a2 2 0 0 1 2 2v3"/><path d="M8 21H5a2 2 0 0 1-2-2v-3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/>';
+const FS_COLLAPSE='<path d="M3 8h3a2 2 0 0 0 2-2V3"/><path d="M21 8h-3a2 2 0 0 1-2-2V3"/><path d="M3 16h3a2 2 0 0 1 2 2v3"/><path d="M21 16h-3a2 2 0 0 0-2 2v3"/>';
+function toggleFullscreen(){ if(document.fullscreenElement||document.webkitFullscreenElement){ (document.exitFullscreen||document.webkitExitFullscreen).call(document); }
+  else { const el=document.documentElement; (el.requestFullscreen||el.webkitRequestFullscreen).call(el); } }
+function syncFsIcon(){ const on=!!(document.fullscreenElement||document.webkitFullscreenElement);
+  fsBtn.querySelector("svg").innerHTML=on?FS_COLLAPSE:FS_EXPAND; fsBtn.title=on?"Exit fullscreen (F)":"Fullscreen (F)"; }
+fsBtn.onclick=toggleFullscreen;
+document.addEventListener("fullscreenchange",syncFsIcon); document.addEventListener("webkitfullscreenchange",syncFsIcon);
+
+/* Draggable toolbar: grabbing the grip docks the bar to whichever screen edge the
+   pointer is nearest (top/bottom stay horizontal, left/right become a vertical column). */
+const DOCKS=["top","bottom","left","right"];
+function setDock(side){ if(!DOCKS.includes(side)) side="top";
+  bar.classList.remove("dock-top","dock-bottom","dock-left","dock-right"); bar.classList.add("dock-"+side);
+  try{ localStorage.setItem("infinidraw.dock",side); }catch(e){} }
+function nearestDock(x,y){ const d={top:y,bottom:innerHeight-y,left:x,right:innerWidth-x};
+  return Object.keys(d).reduce((a,b)=>d[b]<d[a]?b:a); }
+setDock((()=>{ try{ return localStorage.getItem("infinidraw.dock"); }catch(e){ return null; } })()||"top");
+const grip=document.getElementById("barGrip"); let dockDrag=false;
+grip.addEventListener("pointerdown",e=>{ dockDrag=true; grip.setPointerCapture(e.pointerId); bar.classList.add("dragging"); e.preventDefault(); });
+grip.addEventListener("pointermove",e=>{ if(dockDrag) setDock(nearestDock(e.clientX,e.clientY)); });
+function endDock(e){ if(!dockDrag) return; dockDrag=false; bar.classList.remove("dragging"); try{ grip.releasePointerCapture(e.pointerId); }catch(_){} }
+grip.addEventListener("pointerup",endDock); grip.addEventListener("pointercancel",endDock);
 
 const swatches=document.getElementById("swatches");
 function activateSwatch(el){ swatches.querySelectorAll(".sw").forEach(s=>s.classList.remove("active")); el.classList.add("active"); }
