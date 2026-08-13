@@ -69,7 +69,6 @@
   <button class="btn" data-tool="line" title="Line (L)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 19 19 5"/></svg></button>
   <button class="btn" data-tool="rect" title="Rectangle (R)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="6" width="16" height="12" rx="1.5"/></svg></button>
   <button class="btn" data-tool="ellipse" title="Ellipse (O)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="12" rx="8" ry="6"/></svg></button>
-  <button class="btn" data-tool="fill" title="Fill (G)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 11 12 4l7 7-7 7z"/><path d="M5 11h14"/><path d="M20 16c0 1.1-.9 2-2 2"/></svg></button>
   <button class="btn" id="imgBtn" data-tool="image" title="Add image (I)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="m4 18 5-5 4 3 3-2 4 4"/></svg></button>
   <button class="btn" data-tool="select" title="Select / move / resize (V)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 4 7 16 2-6 6-2z"/></svg></button>
   <button class="btn" data-tool="eraser" title="Eraser (E)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 20h11"/><path d="M15.5 5.5 20 10a2 2 0 0 1 0 2.8L12 20H8l-4-4a2 2 0 0 1 0-2.8l7.7-7.7a2 2 0 0 1 2.8 0z"/></svg></button>
@@ -126,7 +125,7 @@ let tool="pen", color="#23252b", size=4, opacity=1;
 /* ---------------- input / physics ---------------- */
 const pointers=new Map();
 let mode=null, panLast=null, pinchStart=null, spaceHeld=false, cursor=null;
-let draft=null, eraseBatch=null;
+let draft=null, eraseSnap=null, eraseNode=null, erasePrev=null;
 let pendingImage=null, placeAnchor=null, previewRect=null;
 let selected=null, dragLast=null, resizeInfo=null, transformSnap=null;
 let dirty=true;
@@ -156,13 +155,11 @@ function hx(c){ c=c.replace('#',''); if(c.length===3)c=c.split('').map(x=>x+x).j
 /* ---------------- dirty / bbox ---------------- */
 function markDirty(node){ let n=node; while(n){ n.dirty=true; n=n.up?n.up.parent:null; } }
 function rasterOK(it){ return it.src && it.src.width && it.src.height; }
+function strokeBB(it){ let x0=1/0,y0=1/0,x1=-1/0,y1=-1/0; for(const p of it.pts){ const pad=(p.w||it.base)/2; if(p.x-pad<x0)x0=p.x-pad; if(p.y-pad<y0)y0=p.y-pad; if(p.x+pad>x1)x1=p.x+pad; if(p.y+pad>y1)y1=p.y+pad; } if(!it.pts.length){x0=y0=x1=y1=0;} return {x0,y0,x1,y1}; }
 function itemBounds(it){
   if(it.kind==="raster"){ const w=(it.src.width||1)*it.s,h=(it.src.height||1)*it.s; return {x0:it.x,y0:it.y,x1:it.x+w,y1:it.y+h}; }
-  let x0=1/0,y0=1/0,x1=-1/0,y1=-1/0;
-  const add=(x,y,p)=>{ if(x-p<x0)x0=x-p; if(y-p<y0)y0=y-p; if(x+p>x1)x1=x+p; if(y+p>y1)y1=y+p; };
-  if(it.kind==="stroke"){ for(const p of it.pts) add(p.x,p.y,(p.w||it.base)/2); }
-  else{ add(it.x0,it.y0,it.base/2); add(it.x1,it.y1,it.base/2); }
-  return {x0,y0,x1,y1};
+  if(it.kind==="shape"){ const p=it.base/2; return {x0:Math.min(it.x0,it.x1)-p,y0:Math.min(it.y0,it.y1)-p,x1:Math.max(it.x0,it.x1)+p,y1:Math.max(it.y0,it.y1)+p}; }
+  return it.bb || (it.bb=strokeBB(it));   // cached; invalidated on edit
 }
 function bboxOf(node){
   if(!node.dirty && node.bbox!==undefined) return node.bbox;
@@ -239,7 +236,7 @@ function drawSelection(){
 }
 function drawCursorRing(){
   if(!cursor||mode==="pan"||mode==="pinch"||mode==="move"||mode==="resize") return;
-  if(tool==="hand"||spaceHeld||tool==="fill"||tool==="image"||tool==="select") return;
+  if(tool==="hand"||spaceHeld||tool==="image"||tool==="select") return;
   const r=Math.max(2, size*(tool==="marker"?2.2:1)/2);   // on-screen brush is always `size` px
   ctx.beginPath(); ctx.arc(cursor.x,cursor.y,r,0,6.2832); ctx.strokeStyle="rgba(35,37,43,.4)"; ctx.lineWidth=1; ctx.stroke();
 }
@@ -287,11 +284,13 @@ function undo(){ const op=history.pop(); if(!op) return;
   if(op.type==="add") applyRemove(op.node,op.item);
   else if(op.type==="erase"){ for(const r of op.removed) op.node.items.splice(Math.min(r.i,op.node.items.length),0,r.item); markDirty(op.node); }
   else if(op.type==="transform"){ setGeom(op.item,op.before); markDirty(op.node); }
+  else if(op.type==="items"){ op.node.items=op.before.slice(); markDirty(op.node); }
   future.push(op); updateHist(); dirty=true; }
 function redo(){ const op=future.pop(); if(!op) return;
   if(op.type==="add"){ op.node.items.push(op.item); markDirty(op.node); }
   else if(op.type==="erase"){ for(const r of [...op.removed].sort((a,b)=>b.i-a.i)){ const i=op.node.items.indexOf(r.item); if(i>=0) op.node.items.splice(i,1);} markDirty(op.node); }
   else if(op.type==="transform"){ setGeom(op.item,op.after); markDirty(op.node); }
+  else if(op.type==="items"){ op.node.items=op.after.slice(); markDirty(op.node); }
   history.push(op); updateHist(); dirty=true; }
 function updateHist(){ document.getElementById("undo").disabled=!history.length; document.getElementById("redo").disabled=!future.length; }
 
@@ -307,14 +306,14 @@ function brushWidth(e,speed){
 }
 function startStroke(p,m,e){
   const it={kind:"stroke",mode:m,color,alpha:m==="marker"?0.32*opacity:(m==="brush"?1:opacity),base:baseWorld(),pts:[{x:wX(p.x),y:wY(p.y),w:brushWidth(e,0)}]};
-  current.items.push(it); draft=it; markDirty(current); dirty=true;
+  it.bb=strokeBB(it); current.items.push(it); draft=it; markDirty(current); dirty=true;
 }
 function extendStroke(p,e){
   if(!draft) return; const last=draft.pts[draft.pts.length-1], wx=wX(p.x),wy=wY(p.y);
   const distS=Math.hypot(sxNow(wx)-sxNow(last.x),syNow(wy)-syNow(last.y));
   const now=performance.now(), dt=Math.max(1,now-lastMoveT); lastMoveT=now;
   const dx=wx-last.x,dy=wy-last.y, m=0.5/camScale;
-  if(dx*dx+dy*dy>m*m){ const w=draft.mode==="brush"?brushWidth(e,distS/dt):draft.base; draft.pts.push({x:wx,y:wy,w}); markDirty(current); dirty=true; }
+  if(dx*dx+dy*dy>m*m){ const w=draft.mode==="brush"?brushWidth(e,distS/dt):draft.base; draft.pts.push({x:wx,y:wy,w}); const bb=draft.bb, pd=w/2; if(bb){ if(wx-pd<bb.x0)bb.x0=wx-pd; if(wy-pd<bb.y0)bb.y0=wy-pd; if(wx+pd>bb.x1)bb.x1=wx+pd; if(wy+pd>bb.y1)bb.y1=wy+pd; } markDirty(current); dirty=true; }
 }
 function startShape(p,shape){ const it={kind:"shape",shape,color,alpha:opacity,base:baseWorld(),x0:wX(p.x),y0:wY(p.y),x1:wX(p.x),y1:wY(p.y)}; current.items.push(it); draft=it; markDirty(current); dirty=true; }
 function extendShape(p){ if(!draft) return; draft.x1=wX(p.x); draft.y1=wY(p.y); markDirty(current); dirty=true; }
@@ -322,8 +321,27 @@ function commitDraft(){ if(!draft) return; const d=draft; draft=null; lastW=0;
   if(d.kind==="shape"&&Math.hypot(sxNow(d.x1)-sxNow(d.x0),syNow(d.y1)-syNow(d.y0))<3){ applyRemove(current,d); return; }
   pushHist({type:"add",node:current,item:d}); }
 
-function eraseAt(p){ const R=Math.max(8,(size*camScale)/2+6);
-  for(let i=current.items.length-1;i>=0;i--){ if(hitItem(current.items[i],p.x,p.y,R)){ const it=current.items[i]; current.items.splice(i,1); eraseBatch.push({item:it,i}); markDirty(current); dirty=true; } } }
+function splitStroke(it,a,b,R){
+  const pts=it.pts, keep=new Array(pts.length); let any=false;
+  for(let i=0;i<pts.length;i++){ const d=segDist(sxNow(pts[i].x),syNow(pts[i].y),a.x,a.y,b.x,b.y); keep[i]=d>R; if(!keep[i]) any=true; }
+  if(!any) return null;                         // eraser didn't touch this stroke
+  const runs=[]; let cur=null;
+  for(let i=0;i<pts.length;i++){ if(keep[i]){ if(!cur){cur=[];runs.push(cur);} cur.push(pts[i]); } else cur=null; }
+  return runs.map(r=>({kind:"stroke",mode:it.mode,color:it.color,alpha:it.alpha,base:it.base,pts:r.map(p=>({x:p.x,y:p.y,w:p.w}))}));
+}
+function eraseStroke(p){
+  const R=Math.max(2.5,size/2), a=erasePrev||p, b=p;                       // pen-sized, screen px
+  const exl=Math.min(a.x,b.x)-R, exr=Math.max(a.x,b.x)+R, eyt=Math.min(a.y,b.y)-R, eyb=Math.max(a.y,b.y)+R;
+  const out=[]; let changed=false;
+  for(const it of current.items){
+    const w=itemBounds(it); const s0=sxNow(w.x0),s1=sxNow(w.x1),t0=syNow(w.y0),t1=syNow(w.y1);
+    if(Math.max(s0,s1)<exl||Math.min(s0,s1)>exr||Math.max(t0,t1)<eyt||Math.min(t0,t1)>eyb){ out.push(it); continue; }  // broad phase: skip far strokes
+    if(it.kind==="stroke"){ const res=splitStroke(it,a,b,R); if(res===null) out.push(it); else { changed=true; for(const s of res) out.push(s); } }
+    else { if(hitItem(it,b.x,b.y,R)||hitItem(it,a.x,a.y,R)) changed=true; else out.push(it); }
+  }
+  if(changed){ current.items=out; markDirty(current); dirty=true; }
+  erasePrev=p;
+}
 function hitItem(it,px,py,R){
   if(it.kind==="stroke"){ for(const q of it.pts){ const dx=sxNow(q.x)-px,dy=syNow(q.y)-py; if(dx*dx+dy*dy<=R*R) return true; } return false; }
   if(it.kind==="raster"){ const x=sxNow(it.x),y=syNow(it.y),w=(it.src.width||1)*it.s*camScale,h=(it.src.height||1)*it.s*camScale; return px>=x-R&&px<=x+w+R&&py>=y-R&&py<=y+h+R; }
@@ -337,12 +355,12 @@ function pickItem(px,py){ const R=Math.max(10,(6)); for(let i=current.items.leng
 
 /* ---------------- select / move / resize ---------------- */
 function geomOf(it){ if(it.kind==="raster")return{x:it.x,y:it.y,s:it.s}; if(it.kind==="shape")return{x0:it.x0,y0:it.y0,x1:it.x1,y1:it.y1,base:it.base}; return{base:it.base,pts:it.pts.map(p=>({x:p.x,y:p.y,w:p.w}))}; }
-function setGeom(it,g){ if(it.kind==="raster"){it.x=g.x;it.y=g.y;it.s=g.s;} else if(it.kind==="shape"){it.x0=g.x0;it.y0=g.y0;it.x1=g.x1;it.y1=g.y1;it.base=g.base;} else {it.base=g.base; it.pts=g.pts.map(p=>({x:p.x,y:p.y,w:p.w}));} }
-function translateItem(it,dx,dy){ if(it.kind==="raster"){it.x+=dx;it.y+=dy;} else if(it.kind==="shape"){it.x0+=dx;it.y0+=dy;it.x1+=dx;it.y1+=dy;} else for(const p of it.pts){p.x+=dx;p.y+=dy;} }
+function setGeom(it,g){ if(it.kind==="raster"){it.x=g.x;it.y=g.y;it.s=g.s;} else if(it.kind==="shape"){it.x0=g.x0;it.y0=g.y0;it.x1=g.x1;it.y1=g.y1;it.base=g.base;} else {it.base=g.base; it.pts=g.pts.map(p=>({x:p.x,y:p.y,w:p.w})); it.bb=undefined;} }
+function translateItem(it,dx,dy){ if(it.kind==="raster"){it.x+=dx;it.y+=dy;} else if(it.kind==="shape"){it.x0+=dx;it.y0+=dy;it.x1+=dx;it.y1+=dy;} else { for(const p of it.pts){p.x+=dx;p.y+=dy;} it.bb=undefined; } }
 function scaleFromSnap(it,snap,pvx,pvy,f){
   if(it.kind==="raster"){ it.x=pvx+(snap.x-pvx)*f; it.y=pvy+(snap.y-pvy)*f; it.s=snap.s*f; }
   else if(it.kind==="shape"){ it.x0=pvx+(snap.x0-pvx)*f; it.y0=pvy+(snap.y0-pvy)*f; it.x1=pvx+(snap.x1-pvx)*f; it.y1=pvy+(snap.y1-pvy)*f; it.base=snap.base*f; }
-  else { it.base=snap.base*f; it.pts=snap.pts.map(p=>({x:pvx+(p.x-pvx)*f,y:pvy+(p.y-pvy)*f,w:p.w*f})); }
+  else { it.base=snap.base*f; it.pts=snap.pts.map(p=>({x:pvx+(p.x-pvx)*f,y:pvy+(p.y-pvy)*f,w:p.w*f})); it.bb=undefined; }
 }
 function selectPointerDown(p){
   if(selected&&current.items.indexOf(selected)>=0){
@@ -360,30 +378,6 @@ function moveSel(p){ if(!selected) return; const dx=(p.x-dragLast.x)/camScale, d
 function resizeSel(p){ if(!selected||!resizeInfo) return; const f=Math.max(0.05,Math.hypot(wX(p.x)-resizeInfo.pvx,wY(p.y)-resizeInfo.pvy)/resizeInfo.len); scaleFromSnap(selected,transformSnap,resizeInfo.pvx,resizeInfo.pvy,f); markDirty(current); dirty=true; }
 function endTransform(){ if(selected&&transformSnap){ const after=geomOf(selected); const changed=JSON.stringify(after)!==JSON.stringify(transformSnap); if(changed) pushHist({type:"transform",node:current,item:selected,before:transformSnap,after}); } transformSnap=null; resizeInfo=null; dragLast=null; }
 function deleteSelected(){ if(!selected) return; const i=current.items.indexOf(selected); if(i>=0){ current.items.splice(i,1); pushHist({type:"erase",node:current,removed:[{item:selected,i}]}); markDirty(current); } selected=null; dirty=true; }
-
-/* ---------------- bucket fill ---------------- */
-function bucketFill(px,py){
-  const dW=canvas.width,dH=canvas.height; let img;
-  try{ img=ctx.getImageData(0,0,dW,dH); }catch(err){ hintFlash("Can't fill over a cross-origin image"); return; }
-  const data=img.data, vis=new Uint8Array(dW*dH), sX=Math.round(px*dpr), sY=Math.round(py*dpr);
-  if(sX<0||sY<0||sX>=dW||sY>=dH) return;
-  const si=(sY*dW+sX)*4, sr=data[si],sg=data[si+1],sb=data[si+2],sa=data[si+3], tol=64*64;
-  const match=i=>{ const dr=data[i]-sr,dg=data[i+1]-sg,db=data[i+2]-sb,da=data[i+3]-sa; return dr*dr+dg*dg+db*db+da*da<=tol; };
-  let minX=sX,maxX=sX,minY=sY,maxY=sY,filled=0; const stack=[sX,sY];
-  while(stack.length){ const y=stack.pop(),x=stack.pop(); let xl=x;
-    while(xl>=0){ if(vis[y*dW+xl]||!match((y*dW+xl)*4))break; xl--; } xl++;
-    let xr=x; while(xr<dW){ if(vis[y*dW+xr]||!match((y*dW+xr)*4))break; xr++; } xr--;
-    for(let i=xl;i<=xr;i++){ vis[y*dW+i]=1; filled++; if(i<minX)minX=i; if(i>maxX)maxX=i; }
-    if(y<minY)minY=y; if(y>maxY)maxY=y;
-    for(let i=xl;i<=xr;i++){ if(y>0&&!vis[(y-1)*dW+i]&&match(((y-1)*dW+i)*4)) stack.push(i,y-1); if(y<dH-1&&!vis[(y+1)*dW+i]&&match(((y+1)*dW+i)*4)) stack.push(i,y+1); } }
-  if(!filled) return;
-  const cw=maxX-minX+1, ch=maxY-minY+1, off=document.createElement("canvas"); off.width=cw; off.height=ch;
-  const octx=off.getContext("2d"), oimg=octx.createImageData(cw,ch), od=oimg.data, [fr,fg,fb]=hx(color), fa=Math.round(255*opacity);
-  for(let y=minY;y<=maxY;y++) for(let x=minX;x<=maxX;x++){ if(vis[y*dW+x]){ const o=((y-minY)*cw+(x-minX))*4; od[o]=fr;od[o+1]=fg;od[o+2]=fb;od[o+3]=fa; } }
-  octx.putImageData(oimg,0,0);
-  const it={kind:"raster",src:off,x:wX(minX/dpr),y:wY(minY/dpr),s:1/(camScale*dpr),alpha:1};
-  current.items.push(it); markDirty(current); pushHist({type:"add",node:current,item:it}); dirty=true;
-}
 
 /* ---------------- image placement ---------------- */
 function placeImage(rect){
@@ -422,14 +416,13 @@ function stopMomentum(){ targetScale=camScale; pVel.x=pVel.y=0; }
 canvas.addEventListener("pointerdown",e=>{
   canvas.setPointerCapture(e.pointerId); const p=local(e); pointers.set(e.pointerId,p); cursor=p; stopMomentum();
   mvVel={x:0,y:0}; mvLast={x:p.x,y:p.y,t:performance.now()};
-  if(pointers.size===2){ if(draft){applyRemove(current,draft);draft=null;} eraseBatch=null; mode="pinch";
+  if(pointers.size===2){ if(draft){applyRemove(current,draft);draft=null;} eraseSnap=null; eraseNode=null; mode="pinch";
     const[a,b]=[...pointers.values()]; pinchStart={dist:Math.hypot(a.x-b.x,a.y-b.y),cx:(a.x+b.x)/2,cy:(a.y+b.y)/2}; dirty=true; return; }
   const wantPan=tool==="hand"||spaceHeld||e.button===1||e.button===2;
   if(wantPan){ mode="pan"; panLast=p; setCursor(); return; }
   if(tool==="pen"||tool==="brush"||tool==="marker"){ mode="draw"; lastMoveT=performance.now(); lastW=0; startStroke(p,tool,e); }
   else if(tool==="line"||tool==="rect"||tool==="ellipse"){ mode="shape"; startShape(p,tool); }
-  else if(tool==="eraser"){ mode="erase"; eraseBatch=[]; eraseAt(p); }
-  else if(tool==="fill"){ mode=null; bucketFill(p.x,p.y); }
+  else if(tool==="eraser"){ mode="erase"; eraseNode=current; eraseSnap=current.items.slice(); erasePrev=null; eraseStroke(p); }
   else if(tool==="select"){ selectPointerDown(p); }
   else if(tool==="image"){ if(pendingImage){ mode="placeimg"; placeAnchor=p; previewRect={x:p.x,y:p.y,w:0,h:0}; } else { fileInput.value=""; fileInput.click(); } }
 });
@@ -445,7 +438,7 @@ canvas.addEventListener("pointermove",e=>{
   }else if(mode==="pan"&&panLast){ camX-=(p.x-panLast.x)/camScale; camY-=(p.y-panLast.y)/camScale; panLast=p; dirty=true; }
   else if(mode==="draw"){ const evs=e.getCoalescedEvents?e.getCoalescedEvents():null; if(evs&&evs.length){ for(const ev of evs) extendStroke(local(ev),ev); } else extendStroke(p,e); }
   else if(mode==="shape"){ extendShape(p); }
-  else if(mode==="erase"){ eraseAt(p); }
+  else if(mode==="erase"){ eraseStroke(p); }
   else if(mode==="move"){ moveSel(p); }
   else if(mode==="resize"){ resizeSel(p); }
   else if(mode==="placeimg"&&placeAnchor){ previewRect={x:Math.min(p.x,placeAnchor.x),y:Math.min(p.y,placeAnchor.y),w:Math.abs(p.x-placeAnchor.x),h:Math.abs(p.y-placeAnchor.y)}; dirty=true; }
@@ -454,7 +447,7 @@ canvas.addEventListener("pointermove",e=>{
 function release(e){
   pointers.delete(e.pointerId);
   if(mode==="draw"||mode==="shape"){ commitDraft(); mode=null; }
-  else if(mode==="erase"){ if(eraseBatch&&eraseBatch.length) pushHist({type:"erase",node:current,removed:eraseBatch}); eraseBatch=null; mode=null; }
+  else if(mode==="erase"){ if(eraseNode&&eraseSnap){ const a=eraseSnap,b=eraseNode.items; let diff=a.length!==b.length; if(!diff) for(let i=0;i<a.length;i++){ if(a[i]!==b[i]){diff=true;break;} } if(diff) pushHist({type:"items",node:eraseNode,before:eraseSnap,after:eraseNode.items.slice()}); } eraseSnap=null; eraseNode=null; erasePrev=null; mode=null; }
   else if(mode==="move"||mode==="resize"){ endTransform(); mode=null; }
   else if(mode==="placeimg"){ placeImage(previewRect||{x:cursor.x,y:cursor.y,w:0,h:0}); placeAnchor=null; mode=null; }
   else if(mode==="pinch"){ if(pointers.size===1){ mode="pan"; panLast=[...pointers.values()][0]; } else if(pointers.size===0){ mode=null; pVel={x:mvVel.x,y:mvVel.y}; } }
@@ -477,7 +470,7 @@ addEventListener("keydown",e=>{
   if(mod&&e.key.toLowerCase()==="s"){ e.preventDefault(); exportDrawing(); return; }
   if(e.target&&e.target.tagName==="INPUT") return;
   if((e.key==="Delete"||e.key==="Backspace")&&selected){ e.preventDefault(); deleteSelected(); return; }
-  const k=e.key.toLowerCase(), map={p:"pen",b:"brush",m:"marker",l:"line",r:"rect",o:"ellipse",g:"fill",v:"select",e:"eraser",h:"hand"};
+  const k=e.key.toLowerCase(), map={p:"pen",b:"brush",m:"marker",l:"line",r:"rect",o:"ellipse",v:"select",e:"eraser",h:"hand"};
   if(k==="i"){ document.getElementById("imgBtn").click(); }
   else if(map[k]) setTool(map[k]);
   else if(k==="="||k==="+")zoomCenter(1.3); else if(k==="-"||k==="_")zoomCenter(1/1.3);
