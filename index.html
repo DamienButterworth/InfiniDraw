@@ -52,6 +52,15 @@
   .bar.dock-top .bar-scroll,.bar.dock-bottom .bar-scroll{flex-direction:row;justify-content:center;touch-action:pan-x}
   .bar.dock-left .bar-scroll,.bar.dock-right .bar-scroll{flex-direction:column;justify-content:center;min-height:0;touch-action:pan-y}
   .bar-scroll.overflowing{justify-content:flex-start!important}
+  /* A touch that starts ON an icon is restricted further still (a child CAN be more restrictive
+     than its pan-x/pan-y ancestor, just never less) so the browser never claims it as the start
+     of a native scroll there — on a touchscreen that native recognition can win the race against
+     our long-press timer after only a few px of the finger's natural tremor, cancelling the press
+     before it ever fires, which made long-press-to-reorder nearly impossible to trigger on touch.
+     Icons fill nearly all of the strip, so this effectively moves touch-scrolling onto the arrow
+     buttons rather than a swipe — an even trade now that those exist, for a drag gesture that's
+     actually reliable instead of a coin-flip. */
+  #barScroll .btn{touch-action:none}
   /* Scroll arrows: #bar-scroll is already scrollable (overflow:auto above), but on a screen too
      small to fit every icon that has no visible scrollbar and no obvious touch/wheel affordance,
      the overflowing icons were effectively stranded — shown only via updateBarArrows() toggling
@@ -171,7 +180,7 @@
   /* layers panel — a movable tool window (drag its header) listing this frame's layers */
   .lpanel{position:fixed;z-index:19;top:64px;right:14px;width:min(238px,calc(100vw - 20px));width:min(238px,calc(100dvw - 20px));display:flex;flex-direction:column;
     background:color-mix(in srgb,var(--bar) 95%,transparent);backdrop-filter:blur(10px) saturate(1.2);
-    border:1px solid var(--bar-edge);border-radius:16px;box-shadow:0 14px 44px rgba(20,22,28,.45);color:var(--text);max-height:74vh}
+    border:1px solid var(--bar-edge);border-radius:16px;box-shadow:0 14px 44px rgba(20,22,28,.45);color:var(--text);max-height:74vh;max-height:74dvh}
   .lpanel[hidden]{display:none}
   .lp-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 8px 9px 13px;
     cursor:grab;border-bottom:1px solid var(--bar-edge);touch-action:none}
@@ -220,7 +229,7 @@
      "set once and forget" preferences that used to sit permanently on the toolbar */
   .spanel{position:fixed;z-index:19;top:64px;right:14px;width:min(270px,calc(100vw - 20px));width:min(270px,calc(100dvw - 20px));display:flex;flex-direction:column;
     background:color-mix(in srgb,var(--bar) 95%,transparent);backdrop-filter:blur(10px) saturate(1.2);
-    border:1px solid var(--bar-edge);border-radius:16px;box-shadow:0 14px 44px rgba(20,22,28,.45);color:var(--text);max-height:74vh}
+    border:1px solid var(--bar-edge);border-radius:16px;box-shadow:0 14px 44px rgba(20,22,28,.45);color:var(--text);max-height:74vh;max-height:74dvh}
   .spanel[hidden]{display:none}
   .sp-body{display:flex;flex-direction:column;padding:4px 6px 6px;overflow-y:auto;min-height:0}
   .sp-row{display:flex;align-items:center;gap:10px;padding:9px 8px}
@@ -232,7 +241,14 @@
   .sp-dockseg .btn{width:30px;padding:0}
   /* per-icon toolbar toggles — a scrollable checklist (bounded height so ~27 rows don't
      blow out the panel) that shows/hides the matching button out on the actual toolbar */
-  .sp-toollist{max-height:224px;overflow-y:auto;display:flex;flex-direction:column;padding:2px 4px 6px}
+  /* flex-shrink:0 matters here: a flex item with overflow:auto gets an automatic min-height of
+     0 (unlike the plain .sp-row items around it, whose overflow:visible keeps their natural
+     content height as a floor) — so once .sp-body's total content outgrew the panel's available
+     height, the flex algorithm dumped nearly all the shrinkage onto this one list, squeezing it
+     down to a few px regardless of its max-height, rather than capping it there and letting
+     .sp-body's own scroll take the rest. That's what made the icon reorder list disappear on a
+     shorter screen — it wasn't just scrolled out of view, its rendered height had collapsed. */
+  .sp-toollist{max-height:224px;flex-shrink:0;overflow-y:auto;display:flex;flex-direction:column;padding:2px 4px 6px}
   .sp-trow{display:flex;align-items:center;gap:6px;padding:5px 6px;border-radius:8px}
   .sp-trow:hover{background:rgba(255,255,255,.05)}
   .sp-trow.sp-dragging{background:rgba(255,255,255,.08);box-shadow:0 4px 14px rgba(20,22,28,.4)}
@@ -2445,7 +2461,7 @@ function tbDragTick(x,y){
   else stopTbAutoScroll();
 }
 addEventListener("pointermove",e=>{
-  if(tbPress&&e.pointerId===tbPress.pointerId&&Math.hypot(e.clientX-tbPress.startX,e.clientY-tbPress.startY)>6) cancelTbPress();
+  if(tbPress&&e.pointerId===tbPress.pointerId&&Math.hypot(e.clientX-tbPress.startX,e.clientY-tbPress.startY)>10) cancelTbPress();
   if(tbDrag&&e.pointerId===tbDrag.pointerId) tbDragTick(e.clientX,e.clientY);
 });
 function endTbDrag(e){
