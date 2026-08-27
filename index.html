@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
 <title>Infinite Zoom Studio</title>
 <style>
-  :root{ --paper:#f7f6f2; --bar:#22242a; --bar-edge:#34373f; --muted:#9aa0ab; --text:#eef0f4; --accent:#2dd4bf; --accent-ink:#0b1512; }
+  :root{ --paper:#f7f6f2; --bar:#22242a; --bar-edge:#34373f; --muted:#9aa0ab; --text:#eef0f4; --accent:#2dd4bf; --accent-ink:#0b1512; --icon-scale:1; }
   *{box-sizing:border-box}
   html,body{margin:0;height:100%;overflow:hidden;
     background:radial-gradient(120% 120% at 50% 42%, #faf9f5 0%, var(--paper) 58%, #efece4 100%);
@@ -31,16 +31,18 @@
   .bar.dock-bottom{bottom:14px;left:50%;transform:translateX(-50%);flex-direction:row;max-width:calc(100vw - 20px);max-width:calc(100dvw - 20px)}
   .bar.dock-left{left:14px;top:50%;transform:translateY(-50%);flex-direction:column;max-height:calc(100vh - 20px);max-height:calc(100dvh - 20px)}
   .bar.dock-right{right:14px;top:50%;transform:translateY(-50%);flex-direction:column;max-height:calc(100vh - 20px);max-height:calc(100dvh - 20px)}
-  .bar.dock-left .sep,.bar.dock-right .sep{width:auto;height:1px;align-self:stretch;margin:3px 4px}
   /* The bulk of the tool icons live in this inner scroller so Settings and Hide — its siblings,
      laid out after it — can never be pushed off-screen or wrapped out of reach: however many
      icons are on, or however cramped the screen, those two stay pinned at a fixed spot and the
      icon strip shrinks (flex:1;min-width/min-height:0) and scrolls internally instead.
-     Vertical (left/right) docks are the one direction with a genuinely fixed/capped cross size —
-     wrapping into a second column there, or centering an overflowing scroll container, has each
-     produced icons rendering outside the bar's own box in some browsers, so that axis stays
-     top-aligned. Horizontal (top/bottom) docks keep the centred look, which has never shown
-     that problem — mobile cramping is now solved by the pinned Settings/Hide instead. */
+     Centered looks right whenever everything fits — especially on an anchored (full-width/
+     -height) bar with only a few icons enabled, where flex-start would leave them bunched at one
+     end of a bar that spans the whole screen edge. But justify-content:center on a container
+     that's actually OVERFLOWING centers the content around the midpoint rather than flush
+     against the start, so scrollLeft/Top's minimum (0) lands short of the true start and
+     permanently strands whatever spills past the "before" edge with no way to scroll to it. So:
+     center by default, and updateBarArrows() below toggles this .overflowing class on/off as
+     content actually starts/stops overflowing, switching to flex-start only while it matters. */
   .bar-scroll{display:flex;align-items:center;gap:5px;flex:1 1 auto;min-width:0;overflow:auto;scrollbar-width:none}
   .bar-scroll::-webkit-scrollbar{display:none}
   /* html/body set touch-action:none globally so the canvas can own pinch/pan/draw gestures —
@@ -48,7 +50,23 @@
      silently strands any overflowing icons on a real touchscreen (mouse-wheel/scrollbar-drag
      testing on desktop won't catch this). */
   .bar.dock-top .bar-scroll,.bar.dock-bottom .bar-scroll{flex-direction:row;justify-content:center;touch-action:pan-x}
-  .bar.dock-left .bar-scroll,.bar.dock-right .bar-scroll{flex-direction:column;justify-content:flex-start;min-height:0;touch-action:pan-y}
+  .bar.dock-left .bar-scroll,.bar.dock-right .bar-scroll{flex-direction:column;justify-content:center;min-height:0;touch-action:pan-y}
+  .bar-scroll.overflowing{justify-content:flex-start!important}
+  /* Scroll arrows: #bar-scroll is already scrollable (overflow:auto above), but on a screen too
+     small to fit every icon that has no visible scrollbar and no obvious touch/wheel affordance,
+     the overflowing icons were effectively stranded — shown only via updateBarArrows() toggling
+     .show once content actually overflows, and only on the end(s) still scrollable. A left-
+     pointing chevron reads correctly for "toward the start" on both axes: rotated 90deg it
+     points up, which is "toward the start" for a vertical (left/right-docked) column too. */
+  .btn.bar-arrow{flex:0 0 auto;display:none}
+  .btn.bar-arrow.show{display:inline-flex}
+  .bar.dock-left .bar-arrow svg,.bar.dock-right .bar-arrow svg{transform:rotate(90deg)}
+  /* During a drag, siblings shift via flipReorder — hovering them as the pointer passes over
+     on the way to a new slot shouldn't also light them up as if independently interactive.
+     pointer-events:none also blocks the hover-tooltip system below; the dragged element itself
+     keeps receiving events regardless (pointer capture bypasses hit-testing entirely). */
+  .bar-scroll.tb-dragging .btn{pointer-events:none}
+  .sp-toollist.row-dragging .sp-trow{pointer-events:none}
   /* anchored variant: the bar sits flush against its edge (full span, square edge-side corners)
      instead of floating as a centred, margined pill — a fixed dock rather than a movable window. */
   .bar.anchored{border-radius:0;box-shadow:0 4px 20px rgba(20,22,28,.35)}
@@ -56,7 +74,6 @@
   .bar.anchored.dock-bottom{bottom:0;left:0;right:0;transform:none;max-width:100vw;width:100vw;max-width:100dvw;width:100dvw;border-left:0;border-right:0;border-bottom:0}
   .bar.anchored.dock-left{left:0;top:0;bottom:0;transform:none;max-height:100vh;height:100vh;max-height:100dvh;height:100dvh;border-top:0;border-bottom:0;border-left:0}
   .bar.anchored.dock-right{right:0;top:0;bottom:0;transform:none;max-height:100vh;height:100vh;max-height:100dvh;height:100dvh;border-top:0;border-bottom:0;border-right:0}
-  .sep{width:1px;align-self:stretch;margin:2px 3px;background:var(--bar-edge)}
   .bar .tool-off{display:none !important}
   .bar .work-only{display:none}
   .bar.work-mode .work-only{display:inline-flex}
@@ -69,28 +86,40 @@
   .btn.active{background:var(--accent);color:var(--accent-ink)}
   .btn[disabled]{opacity:.35;cursor:default}
   .btn[disabled]:hover{background:transparent;color:var(--muted)}
+  /* Icon size setting: only the toolbar's own buttons scale (not Settings/layers/colour-picker
+     buttons elsewhere, which also happen to use .btn) — scoped via the #bar ancestor. The drag
+     ghost is cloned out to <body> though, so it falls outside that ancestry; it's included by
+     name instead so a dragged icon still enlarges/shrinks to match the chosen size. */
+  #bar .btn,.reorder-ghost{height:calc(40px * var(--icon-scale));min-width:calc(40px * var(--icon-scale));
+    padding:0 calc(9px * var(--icon-scale));border-radius:calc(11px * var(--icon-scale))}
+  #bar .btn svg,.reorder-ghost svg{width:calc(19px * var(--icon-scale));height:calc(19px * var(--icon-scale))}
+  #bar .bgpick .dot,.reorder-ghost.bgpick .dot{width:calc(16px * var(--icon-scale));height:calc(16px * var(--icon-scale))}
   /* ink + canvas colour buttons: a small swatch dot that opens the built-in picker */
   .bgpick{position:relative;overflow:hidden}
   .bgpick .dot{width:16px;height:16px;border-radius:4px;border:1.5px solid rgba(255,255,255,.35);box-shadow:inset 0 0 0 1px rgba(0,0,0,.15)}
   /* built-in colour picker (replaces the native <input type=color>, which on many phones
      offers only a fixed swatch grid rather than the full spectrum) */
-  .cpick{position:fixed;z-index:20;display:flex;flex-direction:column;gap:10px;width:232px;padding:12px;
+  .cpick{position:fixed;z-index:20;display:flex;flex-direction:column;gap:10px;width:252px;padding:12px;
     background:color-mix(in srgb,var(--bar) 96%,transparent);backdrop-filter:blur(10px) saturate(1.2);
     border:1px solid var(--bar-edge);border-radius:16px;box-shadow:0 12px 40px rgba(20,22,28,.45)}
   .cpick[hidden]{display:none}
-  .cp-sv{position:relative;width:208px;height:132px;border-radius:10px;cursor:crosshair;touch-action:none;
+  .cp-sv{position:relative;width:228px;height:132px;border-radius:10px;cursor:crosshair;touch-action:none;
     background:linear-gradient(to bottom,rgba(0,0,0,0),#000),linear-gradient(to right,#fff,rgba(255,255,255,0)),#f00}
   .cp-dot{position:absolute;width:16px;height:16px;border-radius:50%;border:2px solid #fff;box-shadow:0 0 0 1px rgba(0,0,0,.5);transform:translate(-50%,-50%);pointer-events:none}
   .cp-hue input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:14px;border-radius:999px;outline:none;
     background:linear-gradient(to right,#f00,#ff0,#0f0,#0ff,#00f,#f0f,#f00)}
   .cp-hue input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;border-radius:50%;background:#fff;border:2px solid #2a2c33;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.4)}
   .cp-hue input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;background:#fff;border:2px solid #2a2c33;cursor:pointer}
-  .cp-foot{display:flex;align-items:center;gap:7px}
+  .cp-foot{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
   .cp-prev{width:26px;height:26px;border-radius:7px;border:1px solid var(--bar-edge);flex:0 0 auto}
   .cp-hash{color:var(--muted);font-size:13px}
-  .cp-hex{flex:1;min-width:0;background:#33363e;border:1px solid #454953;border-radius:8px;color:var(--text);
+  .cp-hex{flex:0 0 auto;width:104px;background:#33363e;border:1px solid #454953;border-radius:8px;color:var(--text);
     font:600 13px ui-monospace,monospace;padding:6px 8px;text-transform:uppercase;letter-spacing:.5px;-webkit-appearance:none}
-  .cp-done{height:32px;background:var(--accent);color:var(--accent-ink);flex:0 0 auto;padding:0 12px}
+  /* flex:1 1 100% forces its own full-width row below the swatch/hex row rather than
+     competing for horizontal space with the hex input — the input's rendered width doesn't
+     always shrink as far as min-width:0 nominally allows, which used to push this button
+     past the picker's edge, rendering outside its rounded box (and possibly off-screen). */
+  .cp-done{height:32px;background:var(--accent);color:var(--accent-ink);flex:1 1 100%;padding:0 12px;justify-content:center}
   .cp-recents{display:flex;flex-wrap:wrap;gap:6px}
   .cp-recents:empty{display:none}
   .cp-recents .rc{width:22px;height:22px;border-radius:6px;cursor:pointer;padding:0;border:1.5px solid rgba(255,255,255,.18);box-shadow:inset 0 0 0 1px rgba(0,0,0,.15)}
@@ -204,10 +233,31 @@
   /* per-icon toolbar toggles — a scrollable checklist (bounded height so ~27 rows don't
      blow out the panel) that shows/hides the matching button out on the actual toolbar */
   .sp-toollist{max-height:224px;overflow-y:auto;display:flex;flex-direction:column;padding:2px 4px 6px}
-  .sp-trow{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 8px;border-radius:8px}
+  .sp-trow{display:flex;align-items:center;gap:6px;padding:5px 6px;border-radius:8px}
   .sp-trow:hover{background:rgba(255,255,255,.05)}
-  .sp-tname{font-size:12.5px;font-weight:600}
+  .sp-trow.sp-dragging{background:rgba(255,255,255,.08);box-shadow:0 4px 14px rgba(20,22,28,.4)}
+  .sp-tname{flex:1;font-size:12.5px;font-weight:600}
   .sp-trow.tool-hidden .sp-tname{opacity:.45}
+  .sp-handle{flex:0 0 auto;width:20px;height:26px;display:inline-flex;align-items:center;justify-content:center;color:var(--muted);cursor:grab;touch-action:none}
+  .sp-handle:hover{color:var(--text)}
+  .sp-handle svg{width:14px;height:14px}
+  /* toolbar drag-to-reorder: siblings jiggle (each with its own small random delay/duration so
+     they're not in lockstep) while the pressed icon is picked up — mirrors the iOS-springboard
+     cue for "these can be rearranged now" that a plain long-press has no other way to communicate.
+     The wiggle animates a wrapper *inside* the button (.jiggle-inner, built on demand by
+     wrapForJiggle()) rather than the button itself, because during a drag the button's own
+     `transform` is separately driven by the live FLIP reflow below — one element can't animate
+     the same CSS property from two independent sources without one clobbering the other. */
+  @keyframes tbWiggle{0%{transform:translateY(0) rotate(-8deg) scale(1.05)}50%{transform:translateY(-6px) rotate(8deg) scale(1.09)}100%{transform:translateY(0) rotate(-8deg) scale(1.05)}}
+  .jiggle-inner{display:inline-flex;align-items:center;justify-content:center;gap:6px}
+  .jiggle-inner.reorder-jiggle{animation:tbWiggle var(--jiggle-dur,.7s) ease-in-out infinite;animation-delay:var(--jiggle-delay,0s);
+    filter:drop-shadow(0 5px 7px rgba(20,22,28,.5))}
+  .btn.reorder-drag{z-index:60;box-shadow:0 10px 26px rgba(20,22,28,.55);background:color-mix(in srgb,var(--accent) 24%,var(--bar));color:var(--text)}
+  .btn.reorder-source-hidden{visibility:hidden}
+  .btn.reorder-ghost{position:fixed;transition:none}
+  /* Live reflow (FLIP): siblings that get pushed aside as the dragged icon/row passes over them
+     animate from their old slot to the new one via flipReorder() below. */
+  .btn.reorder-flip,.sp-trow.reorder-flip{transition:transform .6s cubic-bezier(.25,.46,.45,.94)}
   .sp-dockseg .btn svg{width:16px;height:16px}
   .spanel input[type=range]{-webkit-appearance:none;appearance:none;width:110px;height:4px;background:#4a4e58;border-radius:999px;outline:none}
   .spanel input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:var(--text);cursor:pointer;border:3px solid var(--bar);box-shadow:0 0 0 1px var(--bar-edge)}
@@ -223,6 +273,7 @@
 <button class="showtools" id="showTools" title="Show tools (Tab)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg></button>
 
 <div class="bar dock-top" id="bar">
+ <button class="btn bar-arrow" id="barPrev" title="Scroll toolbar" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg></button>
  <div class="bar-scroll" id="barScroll">
   <button class="btn active" data-tool="pen" title="Pen (P)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19l7-7-4-4-7 7-1 5z"/><path d="M15 8l1 1"/></svg></button>
   <button class="btn" data-tool="brush" title="Brush — pressure sensitive (B)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20c2-1 3-3 3-5"/><path d="M14 4l6 6-8 6-4-4z"/></svg></button>
@@ -240,34 +291,28 @@
   <button class="btn" data-tool="hand" title="Pan (H / Space / two fingers)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 11V6.5a1.5 1.5 0 0 0-3 0V11m0-1.5V5a1.5 1.5 0 0 0-3 0v6m0-5.5a1.5 1.5 0 0 0-3 0V12m0-3.5a1.5 1.5 0 0 0-3 0V15c0 3.3 2.7 6 6 6a6 6 0 0 0 6-6v-3"/></svg></button>
   <button class="btn" data-tool="loupe" title="Magnifier — hover to inspect detail (G)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><circle cx="11" cy="11" r="3"/><path d="m21 21-4.3-4.3"/></svg></button>
 
-  <span class="sep"></span>
   <button class="btn" id="zoomOut" title="Zoom out (−)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/><path d="M8 11h6"/></svg></button>
   <button class="btn" id="zoomIn" title="Zoom in (+)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/><path d="M11 8v6"/><path d="M8 11h6"/></svg></button>
 
-  <span class="sep"></span>
   <button class="btn" id="zoomOuter" title="Fly to outermost drawing"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="M21 3l-7 7"/><path d="M3 21l7-7"/></svg></button>
   <button class="btn" id="zoomInner" title="Fly to innermost drawing"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14h6v6"/><path d="M20 10h-6V4"/><path d="M14 10l7-7"/><path d="M3 21l7-7"/></svg></button>
   <button class="btn" id="layersBtn" title="Layers panel (Y)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 8l9 5 9-5-9-5z"/><path d="m3 13 9 5 9-5"/></svg></button>
 
-  <span class="sep"></span>
   <button class="btn bgpick" id="inkWrap" title="Ink colour"><span class="dot" id="inkDot" style="background:#23252b"></span></button>
   <button class="btn" data-tool="eyedrop" title="Eyedropper — pick a colour (K, or Alt-click)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m19 3-1.5 1.5"/><path d="M17.5 4.5 20 7l-8.5 8.5-2.5.5.5-2.5z"/><path d="M9 13l-4 4a1.5 1.5 0 0 0 2 2l4-4"/></svg></button>
 
-  <span class="sep"></span>
   <button class="btn slbtn" id="sizeBtn" title="Brush size"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round"><path d="M4 7h16" stroke-width="1.2"/><path d="M4 12h16" stroke-width="2.6"/><path d="M4 17h16" stroke-width="4.2"/></svg></button>
   <button class="btn slbtn" id="opacityBtn" title="Opacity"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor" stroke="none"/></svg></button>
 
-  <span class="sep"></span>
   <button class="btn" id="undo" title="Undo (Ctrl+Z)" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-3"/></svg></button>
   <button class="btn" id="redo" title="Redo (Ctrl+Shift+Z)" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 14 5-5-5-5"/><path d="M20 9H9a5 5 0 0 0 0 10h3"/></svg></button>
   <button class="btn" id="clear" title="New canvas"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M6 6l1 14h10l1-14"/></svg></button>
 
-  <span class="sep"></span>
   <button class="btn" id="exportBtn" title="Export drawing (.json)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m8 11 4 4 4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg></button>
   <button class="btn" id="importBtn" title="Import drawing (.json)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3"/><path d="m8 7 4-4 4 4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg></button>
  </div>
+ <button class="btn bar-arrow" id="barNext" title="Scroll toolbar" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></button>
 
-  <span class="sep"></span>
   <button class="btn" id="settingsBtn" title="Settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
   <button class="btn" id="hideBtn" title="Hide toolbar (Tab)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></button>
 </div>
@@ -352,6 +397,11 @@
         <button class="btn" id="dockLeftBtn" title="Dock to left"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M8 3v18" stroke-width="4"/></svg></button>
         <button class="btn" id="dockRightBtn" title="Dock to right"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M16 3v18" stroke-width="4"/></svg></button>
       </div>
+    </div>
+    <div class="sp-row">
+      <span class="sp-label">Icon size</span>
+      <input type="range" id="iconSizeRange" min="80" max="180" step="10" value="100">
+      <span class="sp-val" id="iconSizeVal">100%</span>
     </div>
     <div class="sp-row">
       <span class="sp-label">Canvas colour</span>
@@ -1760,7 +1810,40 @@ addEventListener("keydown",e=>{
 addEventListener("keyup",e=>{ if(e.code==="Space"){ spaceHeld=false; setCursor(); dirty=true; } });
 
 /* ---------------- toolbar ---------------- */
-const bar=document.getElementById("bar"), showTools=document.getElementById("showTools");
+const bar=document.getElementById("bar"), barScroll=document.getElementById("barScroll"), showTools=document.getElementById("showTools");
+
+/* Scroll arrows: #bar-scroll can overflow (too many icons, too small a screen, icon size
+   turned up) with no visible scrollbar and no obvious touch/wheel affordance — these give it
+   one, and hide themselves the moment there's nothing left to scroll to on that side. */
+const barPrev=document.getElementById("barPrev"), barNext=document.getElementById("barNext");
+function barIsVertical(){ return bar.classList.contains("dock-left")||bar.classList.contains("dock-right"); }
+function updateBarArrows(){
+  const vertical=barIsVertical();
+  const scrollPos=vertical?barScroll.scrollTop:barScroll.scrollLeft;
+  const scrollSize=vertical?barScroll.scrollHeight:barScroll.scrollWidth;
+  const clientSize=vertical?barScroll.clientHeight:barScroll.clientWidth;
+  const overflow=scrollSize-clientSize>1;
+  barScroll.classList.toggle("overflowing",overflow);   // centered when everything fits, flush-start (scrollable to the true edge) once it doesn't
+  barPrev.classList.toggle("show",overflow&&scrollPos>1);
+  barNext.classList.toggle("show",overflow&&scrollPos<scrollSize-clientSize-1);
+}
+function scrollBarBy(dir){ const vertical=barIsVertical(), amt=dir*140;
+  barScroll.scrollBy(vertical?{top:amt,behavior:"smooth"}:{left:amt,behavior:"smooth"}); }
+barPrev.addEventListener("click",()=>scrollBarBy(-1));
+barNext.addEventListener("click",()=>scrollBarBy(1));
+barScroll.addEventListener("scroll",updateBarArrows);
+addEventListener("resize",updateBarArrows);
+/* Auto-scroll while a drag hovers an arrow (see beginTbDrag/endTbDrag below for start/stop). */
+let tbAutoScroll=null;
+function tbAutoScrollTick(){ const vertical=barIsVertical();
+  if(vertical) barScroll.scrollTop+=tbAutoScroll.dir*12; else barScroll.scrollLeft+=tbAutoScroll.dir*12;
+  updateBarArrows();
+  if(tbDrag) tbDragTick(tbDrag.lastX,tbDrag.lastY);   // keep live-reflow current even while the pointer itself sits still over the arrow
+}
+function startTbAutoScroll(dir){ if(tbAutoScroll&&tbAutoScroll.dir===dir) return; stopTbAutoScroll();
+  tbAutoScroll={dir,id:setInterval(tbAutoScrollTick,16)}; }
+function stopTbAutoScroll(){ if(tbAutoScroll){ clearInterval(tbAutoScroll.id); tbAutoScroll=null; } }
+function pointInRect(x,y,r){ return x>=r.left&&x<=r.right&&y>=r.top&&y<=r.bottom; }
 function setTool(t){ if(t!=="text") finishTextEdit(); tool=t; document.querySelectorAll("[data-tool]").forEach(b=>b.classList.toggle("active",b.dataset.tool===t)); if(t!=="image"){ pendingImage=null; previewRect=null; } if(t!=="select"){ selected=null; groupSel=null; } if(t!=="region"){ regionDraft=null; closeRgPop(); } if(t!=="flownode") closeFnPop(); setCursor(); dirty=true; }
 function setCursor(){ canvas.style.cursor=(tool==="hand"||spaceHeld)?(mode==="pan"?"grabbing":"grab"):(tool==="loupe"?"none":(tool==="select"?"default":(tool==="text"?"text":"crosshair"))); }
 document.querySelectorAll("[data-tool]").forEach(b=>{ if(b.id==="imgBtn"||b.id==="regionBtn"||b.id==="flowNodeBtn") return; b.onclick=()=>setTool(b.dataset.tool); });
@@ -1865,7 +1948,7 @@ const dockBtns={top:document.getElementById("dockTopBtn"),bottom:document.getEle
 function setDock(side){ if(!DOCKS.includes(side)) side="top";
   bar.classList.remove("dock-top","dock-bottom","dock-left","dock-right"); bar.classList.add("dock-"+side);
   for(const d of DOCKS) dockBtns[d].classList.toggle("active",d===side);
-  try{ localStorage.setItem("infinidraw.dock",side); }catch(e){} syncShowTools(); repositionFloatingPanels(); }
+  try{ localStorage.setItem("infinidraw.dock",side); }catch(e){} syncShowTools(); repositionFloatingPanels(); updateBarArrows(); }
 setDock((()=>{ try{ return localStorage.getItem("infinidraw.dock"); }catch(e){ return null; } })()||"top");
 for(const d of DOCKS) dockBtns[d].onclick=()=>setDock(d);
 
@@ -1876,7 +1959,7 @@ const uiFloatBtn=document.getElementById("uiFloatBtn"), uiAnchorBtn=document.get
 function setUiStyle(style){ style=style==="anchored"?"anchored":"floating";
   bar.classList.toggle("anchored",style==="anchored");
   uiFloatBtn.classList.toggle("active",style==="floating"); uiAnchorBtn.classList.toggle("active",style==="anchored");
-  try{ localStorage.setItem("infinidraw.uistyle",style); }catch(e){} syncShowTools(); repositionFloatingPanels(); }
+  try{ localStorage.setItem("infinidraw.uistyle",style); }catch(e){} syncShowTools(); repositionFloatingPanels(); updateBarArrows(); }
 setUiStyle((()=>{ try{ return localStorage.getItem("infinidraw.uistyle"); }catch(e){ return null; } })()||"floating");
 uiFloatBtn.onclick=()=>setUiStyle("floating"); uiAnchorBtn.onclick=()=>setUiStyle("anchored");
 
@@ -1993,6 +2076,16 @@ const stabRange=document.getElementById("stabRange"), stabVal=document.getElemen
 function setSmooth(pct){ pct=Math.max(0,Math.min(90,Math.round(pct))); smoothing=pct/100;
   stabRange.value=pct; stabVal.textContent=pct+"%"; }
 stabRange.oninput=()=>setSmooth(+stabRange.value);
+
+const iconSizeRange=document.getElementById("iconSizeRange"), iconSizeVal=document.getElementById("iconSizeVal");
+function setIconScale(pct){ pct=Math.max(80,Math.min(180,Math.round(pct)));
+  document.documentElement.style.setProperty("--icon-scale",(pct/100).toFixed(2));
+  iconSizeRange.value=pct; iconSizeVal.textContent=pct+"%";
+  try{ localStorage.setItem("infinidraw.iconScale",pct); }catch(e){}
+  updateBarArrows();   // bigger icons can newly overflow the bar (or smaller ones stop overflowing)
+}
+iconSizeRange.oninput=()=>setIconScale(+iconSizeRange.value);
+setIconScale((()=>{ try{ return +localStorage.getItem("infinidraw.iconScale"); }catch(e){ return NaN; } })()||100);
 function closeSlPop(){ slpop.hidden=true; slpopTarget=null; }
 function openSlPop(target,anchor){
   if(!slpop.hidden && slpopTarget===target){ closeSlPop(); return; }   // second tap on the same button closes it
@@ -2076,6 +2169,7 @@ function toggleSettings(){ spanel.hidden=!spanel.hidden; settingsBtn.classList.t
 settingsBtn.onclick=toggleSettings;
 document.getElementById("spClose").onclick=toggleSettings;
 spanel.addEventListener("pointerdown",e=>e.stopPropagation());   // keep panel clicks off the canvas
+addEventListener("pointerdown",e=>{ if(!spanel.hidden && !spanel.contains(e.target) && !settingsBtn.contains(e.target) && !cpick.contains(e.target)) toggleSettings(); });   // clicking/drawing anywhere else (including the canvas) closes it — cpick excluded since the canvas-colour swatch opens it from inside Settings
 let spDrag=null;
 spHead.addEventListener("pointerdown",e=>{ if(e.target.closest("#spClose")) return; spDrag={dx:e.clientX-spanel.offsetLeft,dy:e.clientY-spanel.offsetTop};
   spHead.setPointerCapture(e.pointerId); e.preventDefault(); });
@@ -2161,6 +2255,7 @@ const TOGGLE_ITEMS=[
   {id:"exportBtn",label:"Export drawing",sel:'#exportBtn'},
   {id:"importBtn",label:"Import drawing",sel:'#importBtn'},
 ];
+const TOGGLE_MAP=new Map(TOGGLE_ITEMS.map(t=>[t.id,t]));
 let hiddenTools=new Set();
 function loadHiddenTools(){
   try{ hiddenTools=new Set(JSON.parse(localStorage.getItem("infinidraw.hiddenTools")||"[]")); }catch(e){ hiddenTools=new Set(); }
@@ -2168,23 +2263,212 @@ function loadHiddenTools(){
 function saveHiddenTools(){ try{ localStorage.setItem("infinidraw.hiddenTools",JSON.stringify([...hiddenTools])); }catch(e){} }
 function applyToolVisibility(){
   for(const t of TOGGLE_ITEMS){ const el=bar.querySelector(t.sel); if(el) el.classList.toggle("tool-off",hiddenTools.has(t.id)); }
+  updateBarArrows();
 }
+
+/* Icon order — shared by the toolbar's actual DOM order and the Settings list's row order,
+   so dragging in either place keeps both in sync. Settings/Hide aren't in TOGGLE_ITEMS at
+   all (they live outside #barScroll, permanently pinned), so they're never part of this. */
+let toolOrder=[];
+function loadToolOrder(){
+  let saved=[]; try{ saved=JSON.parse(localStorage.getItem("infinidraw.toolOrder")||"[]"); }catch(e){ saved=[]; }
+  const valid=saved.filter(id=>TOGGLE_MAP.has(id)), seen=new Set(valid);
+  for(const t of TOGGLE_ITEMS) if(!seen.has(t.id)) valid.push(t.id);   // tools added since the order was last saved land at the end
+  toolOrder=valid;
+}
+function saveToolOrder(){ try{ localStorage.setItem("infinidraw.toolOrder",JSON.stringify(toolOrder)); }catch(e){} }
+function applyToolOrder(){
+  for(const id of toolOrder){ const t=TOGGLE_MAP.get(id); const el=t&&bar.querySelector(t.sel); if(el) barScroll.appendChild(el); }   // appendChild on an existing node MOVES it
+  renderToolToggles();
+}
+
+/* Shared by both drag surfaces (toolbar icons, Settings rows): figure out which sibling the
+   pointer is currently past the midpoint of, along the given axis — the slot `movingEl` would
+   land in if dropped right now. Hidden siblings (offsetParent null — tool-off / work-mode-hidden)
+   are skipped since they don't occupy a visible slot to displace. */
+function computeDropTarget(container,movingEl,axis,cx,cy){
+  const siblings=[...container.children].filter(c=>c!==movingEl&&c.offsetParent!==null);
+  for(const sib of siblings){
+    const r=sib.getBoundingClientRect();
+    const mid=axis==="x"?r.left+r.width/2:r.top+r.height/2, pos=axis==="x"?cx:cy;
+    if(pos<mid) return sib;
+  }
+  return null;
+}
+/* FLIP reorder: move `el` to sit before `target` (or append if null), then animate every
+   sibling that shifted as a result from its old position to its new one — el itself is left
+   untouched (it's either invisible mid-drag or already tracking the pointer separately). */
+function flipReorder(container,el,target){
+  const kids=[...container.children].filter(c=>c!==el);
+  const first=kids.map(c=>[c,c.getBoundingClientRect()]);
+  if(target) container.insertBefore(el,target); else container.appendChild(el);
+  for(const[c,f]of first){
+    const l=c.getBoundingClientRect(), dx=f.left-l.left, dy=f.top-l.top;
+    if(!dx&&!dy) continue;
+    /* Re-entering this mid-glide (the common case — the target sibling changes on almost every
+       pointermove during a real drag) needs the "jump back to where it visually is right now"
+       step to be genuinely instant. Without transition:none here it still falls back to the
+       base .btn rule's own transform transition (.06s) while .reorder-flip is off, so this jump
+       quietly animated too — compounding with the glide that follows into a stutter that read
+       as icons "snapping" into place rather than sliding smoothly. */
+    c.classList.remove("reorder-flip");
+    c.style.transition="none";
+    c.style.transform="translate("+dx+"px,"+dy+"px)";
+    c.getBoundingClientRect();                          // force layout so the next line transitions from here, not from the target state
+    c.style.transition="";
+    c.classList.add("reorder-flip");
+    c.style.transform="";
+    c.addEventListener("transitionend",function done(ev){ if(ev.propertyName==="transform"){ c.classList.remove("reorder-flip"); c.removeEventListener("transitionend",done); } });
+  }
+}
+function wrapForJiggle(btn){
+  let inner=btn.querySelector(":scope > .jiggle-inner");
+  if(inner) return inner;
+  inner=document.createElement("span"); inner.className="jiggle-inner";
+  while(btn.firstChild) inner.appendChild(btn.firstChild);
+  btn.appendChild(inner);
+  return inner;
+}
+function unwrapJiggle(btn){
+  const inner=btn.querySelector(":scope > .jiggle-inner"); if(!inner) return;
+  while(inner.firstChild) btn.insertBefore(inner.firstChild,inner);
+  inner.remove();
+}
+
 const spToolList=document.getElementById("spToolList"), spToolCount=document.getElementById("spToolCount");
+const DRAG_HANDLE_ICON='<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><circle cx="9" cy="6" r="1.3"/><circle cx="15" cy="6" r="1.3"/><circle cx="9" cy="12" r="1.3"/><circle cx="15" cy="12" r="1.3"/><circle cx="9" cy="18" r="1.3"/><circle cx="15" cy="18" r="1.3"/></svg>';
 function renderToolToggles(){
   spToolList.innerHTML="";
-  for(const t of TOGGLE_ITEMS){
+  for(const id of toolOrder){
+    const t=TOGGLE_MAP.get(id); if(!t) continue;
     const off=hiddenTools.has(t.id);
-    const row=document.createElement("div"); row.className="sp-trow"+(off?" tool-hidden":"");
+    const row=document.createElement("div"); row.className="sp-trow"+(off?" tool-hidden":""); row.dataset.id=t.id;
+    const handle=document.createElement("span"); handle.className="sp-handle"; handle.title="Drag to reorder"; handle.innerHTML=DRAG_HANDLE_ICON;
     const name=document.createElement("span"); name.className="sp-tname"; name.textContent=t.label;
     const eye=document.createElement("button"); eye.className="lp-eye"; eye.innerHTML=off?EYE_OFF:EYE_ON;
     eye.title=off?"Show "+t.label+" on the toolbar":"Hide "+t.label+" from the toolbar";
     eye.onclick=()=>{ if(off) hiddenTools.delete(t.id); else hiddenTools.add(t.id);
       saveHiddenTools(); applyToolVisibility(); renderToolToggles(); };
-    row.appendChild(name); row.appendChild(eye); spToolList.appendChild(row);
+    handle.addEventListener("pointerdown",e=>startSpRowDrag(e,row));
+    row.appendChild(handle); row.appendChild(name); row.appendChild(eye); spToolList.appendChild(row);
   }
   spToolCount.textContent=(TOGGLE_ITEMS.length-hiddenTools.size)+"/"+TOGGLE_ITEMS.length;
 }
-loadHiddenTools(); applyToolVisibility(); renderToolToggles();
+
+/* Settings list drag-reorder: no gesture ambiguity here (only the eye button is otherwise
+   clickable), so the handle can start a drag immediately — no long-press needed. The row
+   follows the pointer vertically; other rows live-reflow out of the way via flipReorder as it
+   passes over them, so the final order is already correct by the time it's dropped.
+   The follow transform is recomputed from the row's live *static* position every move (not
+   accumulated from the drag's start point) — flipReorder physically relocates the row in the
+   DOM as it passes other rows, which alone would jump the row's layout box; reading the fresh
+   static position each time folds that jump into the transform instead of letting it show. */
+let spRowDrag=null;
+function startSpRowDrag(e,row){
+  spRowDrag={row,pointerId:e.pointerId,grabDY:e.clientY-row.getBoundingClientRect().top,lastTarget:row.nextElementSibling||null};
+  row.classList.add("sp-dragging"); spToolList.classList.add("row-dragging");
+  try{ e.target.setPointerCapture(e.pointerId); }catch(_){}
+  e.preventDefault();
+}
+function spRowFollow(e){
+  const row=spRowDrag.row;
+  const target=computeDropTarget(spToolList,row,"y",e.clientX,e.clientY);
+  if(target!==spRowDrag.lastTarget){ flipReorder(spToolList,row,target); spRowDrag.lastTarget=target; }
+  row.style.transform="";
+  const staticTop=row.getBoundingClientRect().top;
+  row.style.transform="translateY("+(e.clientY-spRowDrag.grabDY-staticTop)+"px)";
+}
+addEventListener("pointermove",e=>{
+  if(!spRowDrag||e.pointerId!==spRowDrag.pointerId) return;
+  spRowFollow(e);
+});
+function endSpRowDrag(e){
+  if(!spRowDrag||e.pointerId!==spRowDrag.pointerId) return;
+  const row=spRowDrag.row; spRowDrag=null;
+  row.style.transform=""; row.classList.remove("sp-dragging"); spToolList.classList.remove("row-dragging");
+  toolOrder=[...spToolList.children].map(r=>r.dataset.id);
+  saveToolOrder(); applyToolOrder();
+}
+addEventListener("pointerup",endSpRowDrag);
+addEventListener("pointercancel",endSpRowDrag);
+
+/* Toolbar drag-to-reorder: long-press an icon (siblings wiggle, the pressed one lifts and
+   follows the pointer) — a plain tap still selects the tool and a plain swipe still scrolls
+   the strip, since nothing here engages until the hold threshold passes without much
+   movement or a release. Event-delegated on #barScroll so it needs no per-button wiring;
+   Settings/Hide live outside barScroll entirely, so they're naturally never draggable here.
+   Dropping outside the toolbar hides the icon instead of reordering it. */
+let tbPress=null, tbDrag=null, suppressNextClick=false;
+function tbReorderableEl(target){ const el=target.closest&&target.closest(".btn"); if(!el||!barScroll.contains(el)) return null;
+  for(const t of TOGGLE_ITEMS) if(bar.querySelector(t.sel)===el) return el; return null; }
+barScroll.addEventListener("pointerdown",e=>{
+  if(tbDrag) return; const el=tbReorderableEl(e.target); if(!el) return;
+  tbPress={el,startX:e.clientX,startY:e.clientY,pointerId:e.pointerId,
+    timer:setTimeout(()=>beginTbDrag(el,e.clientX,e.clientY,e.pointerId),450)};
+});
+function cancelTbPress(){ if(tbPress){ clearTimeout(tbPress.timer); tbPress=null; } }
+function beginTbDrag(el,x,y,pointerId){
+  tbPress=null;
+  let id=null; for(const t of TOGGLE_ITEMS) if(bar.querySelector(t.sel)===el){ id=t.id; break; } if(!id) return;
+  const axis=(bar.classList.contains("dock-left")||bar.classList.contains("dock-right"))?"y":"x";
+  const r=el.getBoundingClientRect();
+  /* #bar-scroll clips (overflow:auto) so a dragged icon transformed within it can never visibly
+     leave the toolbar strip — a free-floating clone appended to <body> as position:fixed has no
+     such ancestor to clip against, so it can follow the pointer anywhere on screen. */
+  const ghost=el.cloneNode(true);
+  ghost.className=el.className+" reorder-ghost reorder-drag";
+  ghost.style.cssText="position:fixed;left:0;top:0;margin:0;width:"+r.width+"px;height:"+r.height+"px;pointer-events:none;z-index:999";
+  ghost.style.transform="translate("+r.left+"px,"+r.top+"px)";
+  document.body.appendChild(ghost);
+  el.classList.add("reorder-source-hidden"); barScroll.classList.add("tb-dragging");
+  tbDrag={id,el,axis,pointerId,ghost,grabDX:x-r.left,grabDY:y-r.top,lastTarget:el.nextElementSibling||null,lastX:x,lastY:y};
+  try{ el.setPointerCapture(pointerId); }catch(_){}
+  for(const c of barScroll.children){ if(c===el||c.offsetParent===null) continue;
+    c.style.setProperty("--jiggle-delay",(Math.random()*0.3)+"s"); c.style.setProperty("--jiggle-dur",(0.6+Math.random()*0.25)+"s");
+    const inner=wrapForJiggle(c); inner.classList.add("reorder-jiggle"); inner.style.animationDirection=Math.random()<0.5?"alternate":"alternate-reverse"; }
+  suppressNextClick=true; dirty=true;
+}
+/* A bigger pickup scale than a hover/press nudge would use — this needs to read unmistakably
+   as "lifted and being carried", not just highlighted, per feedback that the previous scale
+   was too subtle to tell a move from a remove at a glance. */
+function tbDragTick(x,y){
+  tbDrag.lastX=x; tbDrag.lastY=y;
+  tbDrag.ghost.style.transform="translate("+(x-tbDrag.grabDX)+"px,"+(y-tbDrag.grabDY)+"px) scale(1.55)";
+  const br=bar.getBoundingClientRect();
+  const inside=x>=br.left&&x<=br.right&&y>=br.top&&y<=br.bottom;
+  if(inside){
+    const target=computeDropTarget(barScroll,tbDrag.el,tbDrag.axis,x,y);
+    if(target!==tbDrag.lastTarget){ flipReorder(barScroll,tbDrag.el,target); tbDrag.lastTarget=target; }
+  }
+  if(barPrev.classList.contains("show")&&pointInRect(x,y,barPrev.getBoundingClientRect())) startTbAutoScroll(-1);
+  else if(barNext.classList.contains("show")&&pointInRect(x,y,barNext.getBoundingClientRect())) startTbAutoScroll(1);
+  else stopTbAutoScroll();
+}
+addEventListener("pointermove",e=>{
+  if(tbPress&&e.pointerId===tbPress.pointerId&&Math.hypot(e.clientX-tbPress.startX,e.clientY-tbPress.startY)>6) cancelTbPress();
+  if(tbDrag&&e.pointerId===tbDrag.pointerId) tbDragTick(e.clientX,e.clientY);
+});
+function endTbDrag(e){
+  const d=tbDrag; if(!d||e.pointerId!==d.pointerId) return; tbDrag=null;
+  stopTbAutoScroll();
+  d.ghost.remove(); d.el.classList.remove("reorder-source-hidden"); barScroll.classList.remove("tb-dragging");
+  for(const c of barScroll.children) unwrapJiggle(c);
+  const br=bar.getBoundingClientRect();
+  const outside=e.clientX<br.left||e.clientX>br.right||e.clientY<br.top||e.clientY>br.bottom;
+  if(outside){
+    hiddenTools.add(d.id); saveHiddenTools(); applyToolOrder(); applyToolVisibility();   // applyToolOrder() also snaps the toolbar DOM back to the last *saved* order, undoing any live-preview shift this cancelled drag caused
+    const label=(TOGGLE_MAP.get(d.id)||{}).label||"Icon"; hintFlash(label+" hidden — re-enable it in Settings");
+  } else {
+    toolOrder=[...barScroll.children].map(el=>{ for(const t of TOGGLE_ITEMS) if(bar.querySelector(t.sel)===el) return t.id; return null; }).filter(Boolean);
+    saveToolOrder(); renderToolToggles();
+  }
+  setTimeout(()=>{ suppressNextClick=false; },50); dirty=true;
+}
+addEventListener("pointerup",e=>{ cancelTbPress(); endTbDrag(e); });
+addEventListener("pointercancel",e=>{ cancelTbPress(); endTbDrag(e); });
+barScroll.addEventListener("click",e=>{ if(suppressNextClick){ e.stopPropagation(); e.preventDefault(); suppressNextClick=false; } },true);
+
+loadHiddenTools(); loadToolOrder(); applyToolVisibility(); applyToolOrder();
 
 /* ---------------- hover tooltips ----------------
    A single shared bubble, positioned per-target, standing in for the native title tooltip
