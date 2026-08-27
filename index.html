@@ -1,0 +1,2219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>Infinite Zoom Studio</title>
+<style>
+  :root{ --paper:#f7f6f2; --bar:#22242a; --bar-edge:#34373f; --muted:#9aa0ab; --text:#eef0f4; --accent:#2dd4bf; --accent-ink:#0b1512; }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;overflow:hidden;
+    background:radial-gradient(120% 120% at 50% 42%, #faf9f5 0%, var(--paper) 58%, #efece4 100%);
+    font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;overscroll-behavior:none}
+  /* touch-action:none lives on the canvas (and, further down, on the few widgets with their own
+     custom pointer-drag: panel headers, the colour picker's SV box) rather than on html/body —
+     a touch-action restriction on an ancestor can't be reopened by a descendant (the effective
+     value is the INTERSECTION down the tree), so a blanket none here would permanently block
+     touch-scrolling anywhere nested under it, including the toolbar's scrollable icon strip. */
+  #c{display:block;position:fixed;inset:0;touch-action:none}
+
+  .bar{position:fixed;display:flex;align-items:center;gap:5px;
+    padding:7px;background:color-mix(in srgb,var(--bar) 92%,transparent);backdrop-filter:blur(10px) saturate(1.2);
+    border:1px solid var(--bar-edge);border-radius:16px;box-shadow:0 8px 30px rgba(20,22,28,.28);z-index:10;
+    flex-wrap:nowrap}
+  /* vh/vw are sized to the browser's LARGEST possible viewport (chrome collapsed) rather than
+     what's actually on screen — on mobile, with the URL bar showing, that overshoots the real
+     visible area and pushed the pinned Settings/Hide past the bottom edge, unreachable (the bar
+     itself never scrolls, only the inner icon strip does). dvh/dvw track the true visible
+     viewport instead; older browsers that don't understand them keep the vh/vw fallback. */
+  .bar.dock-top{top:14px;left:50%;transform:translateX(-50%);flex-direction:row;max-width:calc(100vw - 20px);max-width:calc(100dvw - 20px)}
+  .bar.dock-bottom{bottom:14px;left:50%;transform:translateX(-50%);flex-direction:row;max-width:calc(100vw - 20px);max-width:calc(100dvw - 20px)}
+  .bar.dock-left{left:14px;top:50%;transform:translateY(-50%);flex-direction:column;max-height:calc(100vh - 20px);max-height:calc(100dvh - 20px)}
+  .bar.dock-right{right:14px;top:50%;transform:translateY(-50%);flex-direction:column;max-height:calc(100vh - 20px);max-height:calc(100dvh - 20px)}
+  .bar.dock-left .sep,.bar.dock-right .sep{width:auto;height:1px;align-self:stretch;margin:3px 4px}
+  /* The bulk of the tool icons live in this inner scroller so Settings and Hide — its siblings,
+     laid out after it — can never be pushed off-screen or wrapped out of reach: however many
+     icons are on, or however cramped the screen, those two stay pinned at a fixed spot and the
+     icon strip shrinks (flex:1;min-width/min-height:0) and scrolls internally instead.
+     Vertical (left/right) docks are the one direction with a genuinely fixed/capped cross size —
+     wrapping into a second column there, or centering an overflowing scroll container, has each
+     produced icons rendering outside the bar's own box in some browsers, so that axis stays
+     top-aligned. Horizontal (top/bottom) docks keep the centred look, which has never shown
+     that problem — mobile cramping is now solved by the pinned Settings/Hide instead. */
+  .bar-scroll{display:flex;align-items:center;gap:5px;flex:1 1 auto;min-width:0;overflow:auto;scrollbar-width:none}
+  .bar-scroll::-webkit-scrollbar{display:none}
+  /* html/body set touch-action:none globally so the canvas can own pinch/pan/draw gestures —
+     but that also swallows touch-scrolling here unless explicitly re-enabled per axis, which
+     silently strands any overflowing icons on a real touchscreen (mouse-wheel/scrollbar-drag
+     testing on desktop won't catch this). */
+  .bar.dock-top .bar-scroll,.bar.dock-bottom .bar-scroll{flex-direction:row;justify-content:center;touch-action:pan-x}
+  .bar.dock-left .bar-scroll,.bar.dock-right .bar-scroll{flex-direction:column;justify-content:flex-start;min-height:0;touch-action:pan-y}
+  /* anchored variant: the bar sits flush against its edge (full span, square edge-side corners)
+     instead of floating as a centred, margined pill — a fixed dock rather than a movable window. */
+  .bar.anchored{border-radius:0;box-shadow:0 4px 20px rgba(20,22,28,.35)}
+  .bar.anchored.dock-top{top:0;left:0;right:0;transform:none;max-width:100vw;width:100vw;max-width:100dvw;width:100dvw;border-left:0;border-right:0;border-top:0}
+  .bar.anchored.dock-bottom{bottom:0;left:0;right:0;transform:none;max-width:100vw;width:100vw;max-width:100dvw;width:100dvw;border-left:0;border-right:0;border-bottom:0}
+  .bar.anchored.dock-left{left:0;top:0;bottom:0;transform:none;max-height:100vh;height:100vh;max-height:100dvh;height:100dvh;border-top:0;border-bottom:0;border-left:0}
+  .bar.anchored.dock-right{right:0;top:0;bottom:0;transform:none;max-height:100vh;height:100vh;max-height:100dvh;height:100dvh;border-top:0;border-bottom:0;border-right:0}
+  .sep{width:1px;align-self:stretch;margin:2px 3px;background:var(--bar-edge)}
+  .bar .tool-off{display:none !important}
+  .bar .work-only{display:none}
+  .bar.work-mode .work-only{display:inline-flex}
+  .btn{appearance:none;border:0;cursor:pointer;height:40px;min-width:40px;padding:0 9px;display:inline-flex;
+    align-items:center;justify-content:center;gap:6px;background:transparent;color:var(--muted);border-radius:11px;
+    font-size:13px;font-weight:600;transition:background .14s,color .14s,transform .06s;-webkit-tap-highlight-color:transparent}
+  .btn svg{width:19px;height:19px;display:block}
+  .btn:hover{background:rgba(255,255,255,.06);color:var(--text)}
+  .btn:active{transform:translateY(1px)}
+  .btn.active{background:var(--accent);color:var(--accent-ink)}
+  .btn[disabled]{opacity:.35;cursor:default}
+  .btn[disabled]:hover{background:transparent;color:var(--muted)}
+  /* ink + canvas colour buttons: a small swatch dot that opens the built-in picker */
+  .bgpick{position:relative;overflow:hidden}
+  .bgpick .dot{width:16px;height:16px;border-radius:4px;border:1.5px solid rgba(255,255,255,.35);box-shadow:inset 0 0 0 1px rgba(0,0,0,.15)}
+  /* built-in colour picker (replaces the native <input type=color>, which on many phones
+     offers only a fixed swatch grid rather than the full spectrum) */
+  .cpick{position:fixed;z-index:20;display:flex;flex-direction:column;gap:10px;width:232px;padding:12px;
+    background:color-mix(in srgb,var(--bar) 96%,transparent);backdrop-filter:blur(10px) saturate(1.2);
+    border:1px solid var(--bar-edge);border-radius:16px;box-shadow:0 12px 40px rgba(20,22,28,.45)}
+  .cpick[hidden]{display:none}
+  .cp-sv{position:relative;width:208px;height:132px;border-radius:10px;cursor:crosshair;touch-action:none;
+    background:linear-gradient(to bottom,rgba(0,0,0,0),#000),linear-gradient(to right,#fff,rgba(255,255,255,0)),#f00}
+  .cp-dot{position:absolute;width:16px;height:16px;border-radius:50%;border:2px solid #fff;box-shadow:0 0 0 1px rgba(0,0,0,.5);transform:translate(-50%,-50%);pointer-events:none}
+  .cp-hue input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:14px;border-radius:999px;outline:none;
+    background:linear-gradient(to right,#f00,#ff0,#0f0,#0ff,#00f,#f0f,#f00)}
+  .cp-hue input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;border-radius:50%;background:#fff;border:2px solid #2a2c33;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,.4)}
+  .cp-hue input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;background:#fff;border:2px solid #2a2c33;cursor:pointer}
+  .cp-foot{display:flex;align-items:center;gap:7px}
+  .cp-prev{width:26px;height:26px;border-radius:7px;border:1px solid var(--bar-edge);flex:0 0 auto}
+  .cp-hash{color:var(--muted);font-size:13px}
+  .cp-hex{flex:1;min-width:0;background:#33363e;border:1px solid #454953;border-radius:8px;color:var(--text);
+    font:600 13px ui-monospace,monospace;padding:6px 8px;text-transform:uppercase;letter-spacing:.5px;-webkit-appearance:none}
+  .cp-done{height:32px;background:var(--accent);color:var(--accent-ink);flex:0 0 auto;padding:0 12px}
+  .cp-recents{display:flex;flex-wrap:wrap;gap:6px}
+  .cp-recents:empty{display:none}
+  .cp-recents .rc{width:22px;height:22px;border-radius:6px;cursor:pointer;padding:0;border:1.5px solid rgba(255,255,255,.18);box-shadow:inset 0 0 0 1px rgba(0,0,0,.15)}
+  .cp-recents .rc:hover{transform:scale(1.1)}
+  /* Size/opacity are icon buttons in every orientation — a tap pops this slider open on
+     demand, so the control never dictates the bar's width (especially on a side dock). */
+  .slpop{position:fixed;z-index:20;display:flex;align-items:center;gap:9px;padding:9px 13px;
+    background:color-mix(in srgb,var(--bar) 96%,transparent);backdrop-filter:blur(10px) saturate(1.2);
+    border:1px solid var(--bar-edge);border-radius:14px;box-shadow:0 12px 40px rgba(20,22,28,.45)}
+  .slpop[hidden]{display:none}
+  .slpop label{color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.4px}
+  .slpop input[type=range]{-webkit-appearance:none;appearance:none;width:150px;height:4px;background:#4a4e58;border-radius:999px;outline:none}
+  .slpop input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;border-radius:50%;background:var(--text);cursor:pointer;border:3px solid var(--bar);box-shadow:0 0 0 1px var(--bar-edge)}
+  .slpop input[type=range]::-moz-range-thumb{width:15px;height:15px;border-radius:50%;background:var(--text);cursor:pointer;border:3px solid var(--bar)}
+  .slpop .slpop-val{color:var(--text);font-size:12px;font-weight:600;min-width:36px;text-align:right}
+
+  /* live text editor: a transparent textarea overlaid exactly on the text item being typed */
+  #textEdit{position:fixed;z-index:15;margin:0;padding:0;border:0;outline:0;background:transparent;resize:none;overflow:hidden;
+    white-space:pre;line-height:1.28;font-weight:600;letter-spacing:0;caret-color:var(--accent);
+    font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  #textEdit[hidden]{display:none}
+
+  .showtools{position:fixed;top:14px;left:14px;z-index:11;display:none;align-items:center;justify-content:center;
+    width:44px;height:44px;border:1px solid var(--bar-edge);border-radius:13px;cursor:pointer;color:var(--text);
+    background:color-mix(in srgb,var(--bar) 92%,transparent);backdrop-filter:blur(10px);box-shadow:0 8px 30px rgba(20,22,28,.28);
+    transition:background .15s,color .15s,border-color .15s}
+  .showtools svg{width:22px;height:22px}
+  .showtools:hover{background:color-mix(in srgb,var(--accent) 16%,var(--bar));color:var(--accent);border-color:color-mix(in srgb,var(--accent) 45%,var(--bar-edge))}
+  .showtools:active{filter:brightness(.92)}
+  /* anchored variant: a flush edge tab (no floating margin/shadow-drop) — wider and flatter
+     than the floating pill, with a chevron hinting which way it opens, so a bar that's flush
+     against the screen edge still reads as a grabbable handle once minimised */
+  .showtools.anchored{border-radius:0;box-shadow:0 4px 14px rgba(20,22,28,.35)}
+  .showtools.anchored.dock-top{top:0;left:50%;transform:translateX(-50%);width:76px;height:22px;border-top:0;border-radius:0 0 10px 10px}
+  .showtools.anchored.dock-bottom{bottom:0;top:auto;left:50%;transform:translateX(-50%);width:76px;height:22px;border-bottom:0;border-radius:10px 10px 0 0}
+  .showtools.anchored.dock-left{left:0;top:50%;transform:translateY(-50%);width:22px;height:76px;border-left:0;border-radius:0 10px 10px 0}
+  .showtools.anchored.dock-right{right:0;left:auto;top:50%;transform:translateY(-50%);width:22px;height:76px;border-right:0;border-radius:10px 0 0 10px}
+  .showtools.anchored svg{width:15px;height:15px}
+  .showtools.anchored:hover{background:color-mix(in srgb,var(--accent) 26%,var(--bar))}
+
+  .hint{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);color:#8a8f99;font-size:12px;
+    background:color-mix(in srgb,var(--bar) 80%,transparent);border:1px solid var(--bar-edge);border-radius:999px;
+    padding:6px 13px;z-index:9;pointer-events:none;display:flex;gap:10px;align-items:center;white-space:nowrap;
+    transition:opacity .5s;max-width:calc(100vw - 20px);max-width:calc(100dvw - 20px);overflow:hidden}
+  .hint kbd{font:inherit;font-size:11px;color:var(--text);background:#33363e;border:1px solid #454953;border-bottom-width:2px;border-radius:5px;padding:1px 6px}
+  .hint.fade{opacity:0}
+  @media (max-width:900px){.hint .desktop-only{display:none}}
+
+  /* layers panel — a movable tool window (drag its header) listing this frame's layers */
+  .lpanel{position:fixed;z-index:19;top:64px;right:14px;width:min(238px,calc(100vw - 20px));width:min(238px,calc(100dvw - 20px));display:flex;flex-direction:column;
+    background:color-mix(in srgb,var(--bar) 95%,transparent);backdrop-filter:blur(10px) saturate(1.2);
+    border:1px solid var(--bar-edge);border-radius:16px;box-shadow:0 14px 44px rgba(20,22,28,.45);color:var(--text);max-height:74vh}
+  .lpanel[hidden]{display:none}
+  .lp-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 8px 9px 13px;
+    cursor:grab;border-bottom:1px solid var(--bar-edge);touch-action:none}
+  .lp-head:active{cursor:grabbing}
+  .lp-title{font-size:13px;font-weight:700;letter-spacing:.3px}
+  .lp-x{appearance:none;border:0;background:transparent;color:var(--muted);cursor:pointer;width:30px;height:30px;
+    border-radius:9px;font-size:15px;line-height:1;display:inline-flex;align-items:center;justify-content:center}
+  .lp-x:hover{background:rgba(255,255,255,.07);color:var(--text)}
+  .lp-list{overflow:auto;padding:6px;display:flex;flex-direction:column;gap:2px;min-height:44px}
+  .lp-row{display:flex;align-items:center;gap:5px;padding:5px 7px;border-radius:9px;cursor:pointer;border:1px solid transparent}
+  .lp-row:hover{background:rgba(255,255,255,.05)}
+  .lp-row.active{background:color-mix(in srgb,var(--accent) 20%,transparent);border-color:color-mix(in srgb,var(--accent) 45%,transparent)}
+  .lp-row.hidden-lyr .lp-name{opacity:.4}
+  .lp-row .lp-name{flex:1;min-width:0;font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .lp-eye,.lp-lock,.lp-zoom{appearance:none;border:0;background:transparent;color:var(--muted);cursor:pointer;flex:0 0 auto;
+    width:26px;height:26px;border-radius:7px;display:inline-flex;align-items:center;justify-content:center}
+  .lp-eye:hover,.lp-lock:hover,.lp-zoom:hover{background:rgba(255,255,255,.08);color:var(--text)}
+  .lp-lock.on{color:var(--accent)}
+  .lp-eye svg,.lp-lock svg{width:16px;height:16px}
+  .lp-zoom{width:24px;height:24px;opacity:.55}
+  .lp-zoom:hover{opacity:1}
+  .lp-zoom svg{width:15px;height:15px}
+  .lp-row:not(:hover) .lp-zoom{opacity:0}
+  .lp-row.active .lp-zoom{opacity:.55}
+  .lp-row.active .lp-zoom:hover{opacity:1}
+  .lp-op{display:flex;align-items:center;gap:8px;padding:8px 12px;border-top:1px solid var(--bar-edge)}
+  .lp-op label{color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.4px;flex:0 0 auto}
+  .lp-op .lp-opval{color:var(--text);font-size:12px;font-weight:600;min-width:38px;text-align:right}
+  .lpanel input[type=range]{-webkit-appearance:none;appearance:none;flex:1;min-width:0;height:4px;background:#4a4e58;border-radius:999px;outline:none}
+  .lpanel input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:var(--text);cursor:pointer;border:3px solid var(--bar);box-shadow:0 0 0 1px var(--bar-edge)}
+  .lpanel input[type=range]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;background:var(--text);cursor:pointer;border:3px solid var(--bar)}
+  .lp-foot{display:flex;gap:2px;padding:7px;border-top:1px solid var(--bar-edge);justify-content:space-between}
+  .lp-foot .btn{height:34px;min-width:34px;padding:0 7px}
+  .lp-foot .btn svg{width:18px;height:18px}
+
+  /* custom hover tooltip — replaces the native title bubble (which is slow, unstyled, and can
+     clip against a flush-anchored bar) with an immediate, theme-matched one for every tool */
+  .tooltip{position:fixed;z-index:30;pointer-events:none;background:#15171b;color:var(--text);
+    font-size:12px;font-weight:600;line-height:1.35;padding:6px 10px;border-radius:8px;
+    border:1px solid var(--bar-edge);box-shadow:0 6px 20px rgba(20,22,28,.4);
+    max-width:220px;white-space:normal;opacity:0;transform:translateY(2px);
+    transition:opacity .1s,transform .1s}
+  .tooltip.show{opacity:1;transform:translateY(0)}
+
+  /* settings panel — same movable-window pattern as the layers panel, holding the
+     "set once and forget" preferences that used to sit permanently on the toolbar */
+  .spanel{position:fixed;z-index:19;top:64px;right:14px;width:min(270px,calc(100vw - 20px));width:min(270px,calc(100dvw - 20px));display:flex;flex-direction:column;
+    background:color-mix(in srgb,var(--bar) 95%,transparent);backdrop-filter:blur(10px) saturate(1.2);
+    border:1px solid var(--bar-edge);border-radius:16px;box-shadow:0 14px 44px rgba(20,22,28,.45);color:var(--text);max-height:74vh}
+  .spanel[hidden]{display:none}
+  .sp-body{display:flex;flex-direction:column;padding:4px 6px 6px;overflow-y:auto;min-height:0}
+  .sp-row{display:flex;align-items:center;gap:10px;padding:9px 8px}
+  .sp-row+.sp-row{border-top:1px solid var(--bar-edge)}
+  .sp-label{flex:1;font-size:13px;font-weight:600}
+  .sp-val{color:var(--text);font-size:12px;font-weight:600;min-width:34px;text-align:right}
+  .sp-seg{display:flex;gap:4px}
+  .sp-seg .btn{height:30px;min-width:0;padding:0 11px;font-size:12px}
+  .sp-dockseg .btn{width:30px;padding:0}
+  /* per-icon toolbar toggles — a scrollable checklist (bounded height so ~27 rows don't
+     blow out the panel) that shows/hides the matching button out on the actual toolbar */
+  .sp-toollist{max-height:224px;overflow-y:auto;display:flex;flex-direction:column;padding:2px 4px 6px}
+  .sp-trow{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 8px;border-radius:8px}
+  .sp-trow:hover{background:rgba(255,255,255,.05)}
+  .sp-tname{font-size:12.5px;font-weight:600}
+  .sp-trow.tool-hidden .sp-tname{opacity:.45}
+  .sp-dockseg .btn svg{width:16px;height:16px}
+  .spanel input[type=range]{-webkit-appearance:none;appearance:none;width:110px;height:4px;background:#4a4e58;border-radius:999px;outline:none}
+  .spanel input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:var(--text);cursor:pointer;border:3px solid var(--bar);box-shadow:0 0 0 1px var(--bar-edge)}
+  .spanel input[type=range]::-moz-range-thumb{width:13px;height:13px;border-radius:50%;background:var(--text);cursor:pointer;border:3px solid var(--bar)}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<input type="file" id="file" accept="image/*" style="display:none">
+<input type="file" id="jsonFile" accept="application/json,.json,.gz" style="display:none">
+<textarea id="textEdit" hidden spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
+
+<button class="showtools" id="showTools" title="Show tools (Tab)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg></button>
+
+<div class="bar dock-top" id="bar">
+ <div class="bar-scroll" id="barScroll">
+  <button class="btn active" data-tool="pen" title="Pen (P)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19l7-7-4-4-7 7-1 5z"/><path d="M15 8l1 1"/></svg></button>
+  <button class="btn" data-tool="brush" title="Brush — pressure sensitive (B)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20c2-1 3-3 3-5"/><path d="M14 4l6 6-8 6-4-4z"/></svg></button>
+  <button class="btn" data-tool="marker" title="Highlighter (M)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l4-7 6 3-4 7"/><path d="M9 11l-2 6 4 2 4-4"/><path d="M5 21h6"/></svg></button>
+  <button class="btn" data-tool="line" title="Line (L)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 19 19 5"/></svg></button>
+  <button class="btn" data-tool="rect" title="Rectangle (R)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="6" width="16" height="12" rx="1.5"/></svg></button>
+  <button class="btn" data-tool="ellipse" title="Ellipse (O)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="12" rx="8" ry="6"/></svg></button>
+  <button class="btn" data-tool="text" title="Text (T)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 6V5h14v1"/><path d="M12 5v14"/><path d="M9 19h6"/></svg></button>
+  <button class="btn" id="imgBtn" data-tool="image" title="Add image (I)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="m4 18 5-5 4 3 3-2 4 4"/></svg></button>
+  <button class="btn work-only" id="flowNodeBtn" data-tool="flownode" title="Node — click again to pick shape (N)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="7" width="14" height="10" rx="2"/><circle cx="3" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="21" cy="12" r="1.3" fill="currentColor" stroke="none"/></svg></button>
+  <button class="btn work-only" data-tool="connect" title="Connect — drag between two nodes (C)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="12" r="2.3"/><circle cx="19" cy="12" r="2.3"/><path d="M7.3 12h9.4"/><path d="m14 9 3 3-3 3"/></svg></button>
+  <button class="btn" data-tool="select" title="Select / move / resize (V)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 4 7 16 2-6 6-2z"/></svg></button>
+  <button class="btn" id="regionBtn" data-tool="region" title="Region cut — lift a piece to move (click again to pick shape)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="3.5 3"><rect x="3" y="3" width="18" height="18" rx="2"/></svg></button>
+  <button class="btn" data-tool="eraser" title="Eraser (E)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 20h11"/><path d="M15.5 5.5 20 10a2 2 0 0 1 0 2.8L12 20H8l-4-4a2 2 0 0 1 0-2.8l7.7-7.7a2 2 0 0 1 2.8 0z"/></svg></button>
+  <button class="btn" data-tool="hand" title="Pan (H / Space / two fingers)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 11V6.5a1.5 1.5 0 0 0-3 0V11m0-1.5V5a1.5 1.5 0 0 0-3 0v6m0-5.5a1.5 1.5 0 0 0-3 0V12m0-3.5a1.5 1.5 0 0 0-3 0V15c0 3.3 2.7 6 6 6a6 6 0 0 0 6-6v-3"/></svg></button>
+  <button class="btn" data-tool="loupe" title="Magnifier — hover to inspect detail (G)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><circle cx="11" cy="11" r="3"/><path d="m21 21-4.3-4.3"/></svg></button>
+
+  <span class="sep"></span>
+  <button class="btn" id="zoomOut" title="Zoom out (−)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/><path d="M8 11h6"/></svg></button>
+  <button class="btn" id="zoomIn" title="Zoom in (+)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/><path d="M11 8v6"/><path d="M8 11h6"/></svg></button>
+
+  <span class="sep"></span>
+  <button class="btn" id="zoomOuter" title="Fly to outermost drawing"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="M21 3l-7 7"/><path d="M3 21l7-7"/></svg></button>
+  <button class="btn" id="zoomInner" title="Fly to innermost drawing"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14h6v6"/><path d="M20 10h-6V4"/><path d="M14 10l7-7"/><path d="M3 21l7-7"/></svg></button>
+  <button class="btn" id="layersBtn" title="Layers panel (Y)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 8l9 5 9-5-9-5z"/><path d="m3 13 9 5 9-5"/></svg></button>
+
+  <span class="sep"></span>
+  <button class="btn bgpick" id="inkWrap" title="Ink colour"><span class="dot" id="inkDot" style="background:#23252b"></span></button>
+  <button class="btn" data-tool="eyedrop" title="Eyedropper — pick a colour (K, or Alt-click)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m19 3-1.5 1.5"/><path d="M17.5 4.5 20 7l-8.5 8.5-2.5.5.5-2.5z"/><path d="M9 13l-4 4a1.5 1.5 0 0 0 2 2l4-4"/></svg></button>
+
+  <span class="sep"></span>
+  <button class="btn slbtn" id="sizeBtn" title="Brush size"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round"><path d="M4 7h16" stroke-width="1.2"/><path d="M4 12h16" stroke-width="2.6"/><path d="M4 17h16" stroke-width="4.2"/></svg></button>
+  <button class="btn slbtn" id="opacityBtn" title="Opacity"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor" stroke="none"/></svg></button>
+
+  <span class="sep"></span>
+  <button class="btn" id="undo" title="Undo (Ctrl+Z)" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-3"/></svg></button>
+  <button class="btn" id="redo" title="Redo (Ctrl+Shift+Z)" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 14 5-5-5-5"/><path d="M20 9H9a5 5 0 0 0 0 10h3"/></svg></button>
+  <button class="btn" id="clear" title="New canvas"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M6 6l1 14h10l1-14"/></svg></button>
+
+  <span class="sep"></span>
+  <button class="btn" id="exportBtn" title="Export drawing (.json)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m8 11 4 4 4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg></button>
+  <button class="btn" id="importBtn" title="Import drawing (.json)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3"/><path d="m8 7 4-4 4 4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg></button>
+ </div>
+
+  <span class="sep"></span>
+  <button class="btn" id="settingsBtn" title="Settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
+  <button class="btn" id="hideBtn" title="Hide toolbar (Tab)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></button>
+</div>
+
+<div class="cpick" id="cpick" hidden>
+  <div class="cp-sv" id="cpSV"><i class="cp-dot" id="cpSVDot"></i></div>
+  <div class="cp-hue"><input type="range" id="cpHue" min="0" max="360" value="270"></div>
+  <div class="cp-foot">
+    <span class="cp-prev" id="cpPrev"></span>
+    <span class="cp-hash">#</span><input type="text" id="cpHex" maxlength="7" spellcheck="false" autocapitalize="off" autocomplete="off">
+    <button class="btn cp-done" id="cpDone">Done</button>
+  </div>
+  <div class="cp-recents" id="cpRecents"></div>
+</div>
+
+<div class="slpop" id="slpop" hidden>
+  <label id="slpopLabel"></label>
+  <input type="range" id="slpopRange">
+  <span class="slpop-val" id="slpopVal"></span>
+</div>
+
+<div class="slpop rgpop" id="rgpop" hidden>
+  <label>Shape</label>
+  <button class="btn rgshape" data-shape="rect" title="Rectangle"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="3.5 3"><rect x="4" y="5" width="16" height="14" rx="1.5"/></svg></button>
+  <button class="btn rgshape" data-shape="ellipse" title="Ellipse"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="3.5 3"><ellipse cx="12" cy="12" rx="8" ry="7"/></svg></button>
+  <button class="btn rgshape" data-shape="lasso" title="Lasso (freehand)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12c0-4 3.6-7 8-7s8 3 8 6.5c0 3-2.6 5.5-6 5.5"/><path d="M9 17.5c1.4.4 1.4 1.8.4 2.6"/></svg></button>
+</div>
+
+<div class="slpop fnpop" id="fnpop" hidden>
+  <label>Shape</label>
+  <button class="btn fnshape" data-fnshape="rect" title="Rectangle"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="5" width="16" height="14" rx="1.5"/></svg></button>
+  <button class="btn fnshape" data-fnshape="diamond" title="Diamond (decision)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M12 3 21 12 12 21 3 12Z"/></svg></button>
+  <button class="btn fnshape" data-fnshape="ellipse" title="Ellipse (start / end)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="12" rx="8" ry="7"/></svg></button>
+</div>
+
+<div class="lpanel" id="lpanel" hidden>
+  <div class="lp-head" id="lpHead">
+    <span class="lp-title">Layers</span>
+    <button class="lp-x" id="lpClose" title="Close (Y)">✕</button>
+  </div>
+  <div class="lp-list" id="lpList"></div>
+  <div class="lp-op">
+    <label>Opacity</label>
+    <input type="range" id="lpOpacity" min="0" max="100" value="100">
+    <span class="lp-opval" id="lpOpacityVal">100%</span>
+  </div>
+  <div class="lp-foot">
+    <button class="btn" id="lpAdd" title="New layer"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg></button>
+    <button class="btn" id="lpDup" title="Duplicate layer"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/></svg></button>
+    <button class="btn" id="lpUp" title="Move layer up"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg></button>
+    <button class="btn" id="lpDown" title="Move layer down"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="m19 12-7 7-7-7"/></svg></button>
+    <button class="btn" id="lpMerge" title="Merge down"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m8 11 4 4 4-4"/><path d="M4 21h16"/></svg></button>
+    <button class="btn" id="lpDel" title="Delete layer"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M6 6l1 14h10l1-14"/></svg></button>
+  </div>
+</div>
+
+<div class="spanel" id="spanel" hidden>
+  <div class="lp-head" id="spHead">
+    <span class="lp-title">Settings</span>
+    <button class="lp-x" id="spClose" title="Close">✕</button>
+  </div>
+  <div class="sp-body">
+    <div class="sp-row">
+      <span class="sp-label">Mode</span>
+      <div class="sp-seg">
+        <button class="btn" id="modeCreativeBtn" title="Creative — free-form drawing: pen, brush, shapes, text, images">Creative</button>
+        <button class="btn" id="modeWorkBtn" title="Work — flowchart / system design: nodes you connect to each other">Work</button>
+      </div>
+    </div>
+    <div class="sp-row">
+      <span class="sp-label">Toolbar style</span>
+      <div class="sp-seg">
+        <button class="btn" id="uiFloatBtn" title="Floating — a movable pill positioned at the edge you choose below">Float</button>
+        <button class="btn" id="uiAnchorBtn" title="Anchored — flush against the edge you choose below, still hideable">Anchor</button>
+      </div>
+    </div>
+    <div class="sp-row">
+      <span class="sp-label">Toolbar position</span>
+      <div class="sp-seg sp-dockseg">
+        <button class="btn" id="dockTopBtn" title="Dock to top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 8h18" stroke-width="4"/></svg></button>
+        <button class="btn" id="dockBottomBtn" title="Dock to bottom"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 16h18" stroke-width="4"/></svg></button>
+        <button class="btn" id="dockLeftBtn" title="Dock to left"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M8 3v18" stroke-width="4"/></svg></button>
+        <button class="btn" id="dockRightBtn" title="Dock to right"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M16 3v18" stroke-width="4"/></svg></button>
+      </div>
+    </div>
+    <div class="sp-row">
+      <span class="sp-label">Canvas colour</span>
+      <button class="btn bgpick" id="bgWrap" title="Canvas colour"><span class="dot" id="bgDot" style="background:#f7f6f2"></span></button>
+    </div>
+    <div class="sp-row">
+      <span class="sp-label">Grid</span>
+      <button class="btn" id="gridBtn" title="Grid: off — click to cycle lines / dots"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9h18"/><path d="M3 15h18"/><path d="M9 3v18"/><path d="M15 3v18"/></svg></button>
+    </div>
+    <div class="sp-row">
+      <span class="sp-label">Stroke stabiliser</span>
+      <input type="range" id="stabRange" min="0" max="90" value="0">
+      <span class="sp-val" id="stabVal">0%</span>
+    </div>
+    <div class="sp-row">
+      <span class="sp-label">Mirror</span>
+      <div class="sp-seg sp-dockseg">
+        <button class="btn" id="mirrorOffBtn" title="Off — pen/brush/marker draw normally"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="8"/><path d="m7 7 10 10"/></svg></button>
+        <button class="btn" id="mirrorVBtn" title="Vertical axis — mirrors left/right"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M12 3v18" stroke-dasharray="3 2"/></svg></button>
+        <button class="btn" id="mirrorHBtn" title="Horizontal axis — mirrors up/down"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 12h18" stroke-dasharray="3 2"/></svg></button>
+        <button class="btn" id="mirrorBothBtn" title="Both — 4-way symmetry"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M12 3v18" stroke-dasharray="3 2"/><path d="M3 12h18" stroke-dasharray="3 2"/></svg></button>
+      </div>
+    </div>
+    <div class="sp-row">
+      <span class="sp-label">Fullscreen</span>
+      <button class="btn" id="fsBtn" title="Fullscreen (F)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M16 3h3a2 2 0 0 1 2 2v3"/><path d="M8 21H5a2 2 0 0 1-2-2v-3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg></button>
+    </div>
+    <div class="sp-row">
+      <span class="sp-label">Toolbar icons</span>
+      <span class="sp-val" id="spToolCount"></span>
+    </div>
+    <div class="sp-toollist" id="spToolList"></div>
+  </div>
+</div>
+
+<div class="hint" id="hint">
+  <span><kbd>Scroll</kbd> / pinch to zoom — endless nested detail</span>
+  <span class="desktop-only"><kbd>Space</kbd>-drag or two-finger pan · flick to coast</span>
+</div>
+
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+(function(){
+"use strict";
+const canvas=document.getElementById("c"), ctx=canvas.getContext("2d");
+const layer=document.createElement("canvas"), lctx=layer.getContext("2d");   // offscreen for isolating each object's erase mask
+const sceneSnap=document.createElement("canvas"), snapCtx=sceneSnap.getContext("2d");   // frozen copy of the scene during an active stroke (see draw())
+let snapValid=false;
+let g=ctx;                                                                    // item-drawing target: main ctx, or the layer while masking
+const fileInput=document.getElementById("file"), jsonFile=document.getElementById("jsonFile");
+const ACCENT="#2dd4bf";
+
+/* ---------------- scene graph (hidden) ---------------- */
+/* Layers (Photoshop/GIMP-style) are GLOBAL — one shared stack (index 0 = back, last = front)
+   spans EVERY zoom frame, so "Layer 1" means the same layer no matter how deep you've zoomed.
+   Frames (nodes) are just invisible coordinate containers created by the zoom engine; they hold
+   items but NOT their own layer list. Every item is tagged with a global layer id `it.lyr`.
+   Within each node the flat items[] array stays GROUPED by global layer order, so the
+   render / erase / bbox / LOD loops need only a cheap visibility/opacity lookup. New drawing
+   lands in the active layer. Layer edits (reorder / merge / delete / duplicate) apply across
+   every frame so the stack stays consistent everywhere. */
+let nid=0, lidCtr=0, flowIdCtr=0;   // flowIdCtr: stable ids for flownode/connector items (fid), unrelated to the frame ids above
+function makeLayer(name){ const id=++lidCtr; return {id, name:name||("Layer "+id), visible:true, locked:false, opacity:1}; }
+let gLayers=[makeLayer("Layer 1")], gActive=gLayers[0].id;   // the single global layer stack + active id
+function makeNode(){ return {id:nid++, items:[], children:[], up:null, dirty:true, bbox:undefined}; }
+let root=makeNode(), current=root;
+/* --- layer helpers (all operate on the global stack) --- */
+function curLayer(){ let l=gLayers.find(L=>L.id===gActive); if(!l){ l=gLayers[gLayers.length-1]; gActive=l?l.id:0; } return l; }
+function layerIndex(id){ return gLayers.findIndex(L=>L.id===id); }
+function layerOf(it){ return gLayers.find(L=>L.id===it.lyr); }
+function cloneLayers(){ return gLayers.map(L=>({id:L.id,name:L.name,visible:L.visible,locked:L.locked,opacity:L.opacity})); }
+/* Walk every frame in the document (root + all descendants). */
+function allNodes(){ const out=[]; (function rec(n){ out.push(n); for(const c of n.children) rec(c.node); })(root); return out; }
+function regroupAll(){ for(const n of allNodes()) regroup(n); }
+function markAllDirty(){ for(const n of allNodes()){ n.dirty=true; n.bbox=undefined; } dirty=true; }
+/* Insert an item at the top of a layer's contiguous block, preserving the grouping invariant
+   (all of a back layer's items precede a front layer's), so array order == render order. */
+function addItemTo(node,it,layerId){
+  const lid = layerId!=null ? layerId : curLayer().id;
+  it.lyr=lid; const li=Math.max(0,layerIndex(lid));
+  let pos=node.items.length;
+  for(let i=0;i<node.items.length;i++){ if(layerIndex(node.items[i].lyr)>li){ pos=i; break; } }
+  node.items.splice(pos,0,it); return it;
+}
+/* Re-sort items into layer order (stable within a layer). Used after a reorder/merge. */
+function regroup(node){ node.items=node.items.map((it,i)=>[it,i]).sort((a,b)=>{ const d=layerIndex(a[0].lyr)-layerIndex(b[0].lyr); return d||a[1]-b[1]; }).map(p=>p[0]); }
+let camX=0, camY=0, camScale=1;
+const CHILD_K=1/6, UP_LEVELS=4, MAX_DEPTH=11;
+let W=0,H=0,VIEW=1,dpr=1;
+
+/* ---------------- tools ---------------- */
+let tool="pen", color="#23252b", size=4, opacity=1, smoothing=0;   // smoothing 0..0.9: stroke stabiliser (lags each sample toward the previous for cleaner inking)
+let bgColor=null;   // canvas background colour; null = default CSS paper gradient
+let workMode=false, flowShape="rect";   // Work mode: flowchart/system-design — Node + Connect tools, alongside the creative ones
+let bendInfo=null;   // Select tool: connector-bend drag in progress ({axis, p1, p2})
+let mirrorMode="off";   // symmetry drawing for pen/brush/marker: off | v | h | both — axis fixed at the current view centre
+let mirrorDrafts=[], mirrorCX=0, mirrorCY=0, mirrorBefore=null;   // extra live copies of the in-progress stroke, the axis frozen for that stroke, and the pre-stroke items snapshot for one atomic undo entry
+let gridMode=0;     // background grid overlay: 0=off, 1=lines, 2=dots (see drawGrid)
+
+/* ---------------- input / physics ---------------- */
+const pointers=new Map();
+let mode=null, panLast=null, pinchStart=null, spaceHeld=false, cursor=null;
+let draft=null, eraseSnap=null, eraseLast=null;   // eraseSnap: node -> pre-drag items clone (for undo); eraseLast: node -> last brush pos (for interpolation)
+let pendingImage=null, placeAnchor=null, previewRect=null;
+let selected=null, dragLast=null, resizeInfo=null, transformSnap=null;
+let regionShape="rect", regionDraft=null;   // marquee region-cut tool: shape + in-progress screen-space path
+let groupSel=null, groupSnap=null, groupPolySnap=null, groupGeomBefore=null, groupBefore=null;   // floating vector selection lifted by a region cut
+let editingText=null, textNew=false, textSize=28, textBefore=null;   // live text-tool editing state (item under edit, whether it was just created, default on-screen size, items snapshot for undo)
+let dirty=true;
+
+let anim=null;   // active fly-to (outer/inner navigation); see frameToNode/stepAnim
+let targetScale=1, anchorSX=0, anchorSY=0;
+let pVel={x:0,y:0}, mvVel={x:0,y:0}, mvLast=null;
+const ZTAU=0.09, PTAU=0.30, FLY_EFOLDS_PER_SEC=5.5;   // fly-to speed: zoom-levels crossed per second, so a long jump isn't crammed into a fixed time
+let lastT=performance.now();
+const history=[], future=[];
+
+/* ---------------- sizing ---------------- */
+function resize(){
+  dpr=Math.min(window.devicePixelRatio||1,2.5);
+  W=innerWidth; H=innerHeight; VIEW=Math.min(W,H);
+  canvas.width=Math.round(W*dpr); canvas.height=Math.round(H*dpr);
+  canvas.style.width=W+"px"; canvas.style.height=H+"px";
+  layer.width=canvas.width; layer.height=canvas.height;
+  sceneSnap.width=canvas.width; sceneSnap.height=canvas.height; snapValid=false;
+  ctx.setTransform(dpr,0,0,dpr,0,0); ctx.imageSmoothingEnabled=true;
+  lctx.imageSmoothingEnabled=true;
+  if(camScale===1){ camScale=VIEW; targetScale=VIEW; }
+  anchorSX=W/2; anchorSY=H/2; dirty=true;
+}
+addEventListener("resize",resize);
+
+const wX=px=>(px-W/2)/camScale+camX, wY=py=>(py-H/2)/camScale+camY;
+const sxNow=wx=>(wx-camX)*camScale+W/2, syNow=wy=>(wy-camY)*camScale+H/2;
+function hx(c){ c=c.replace('#',''); if(c.length===3)c=c.split('').map(x=>x+x).join(''); return [parseInt(c.slice(0,2),16),parseInt(c.slice(2,4),16),parseInt(c.slice(4,6),16)]; }
+
+/* ---------------- dirty / bbox ---------------- */
+function markDirty(node){ let n=node; while(n){ n.dirty=true; n=n.up?n.up.parent:null; } }
+function nodeHasContent(node){ if(node.items.length) return true; for(const c of node.children) if(nodeHasContent(c.node)) return true; return false; }
+function onCurrentPath(node){ let n=current; while(n){ if(n===node) return true; n=n.up?n.up.parent:null; } return false; }
+/* Detach every frame that holds no content (and whose whole subtree is empty), except the
+   frame the camera currently lives in. Returns the removed links so the change is undoable. */
+function detachEmptyFrames(){
+  const removed=[];
+  (function rec(node){
+    for(let i=node.children.length-1;i>=0;i--){
+      const c=node.children[i]; rec(c.node);
+      if(!nodeHasContent(c.node) && !onCurrentPath(c.node)){ node.children.splice(i,1); removed.push({parent:node,child:c,index:i}); markDirty(node); }
+    }
+  })(root);
+  return removed;
+}
+function rasterOK(it){ return it.src && it.src.width && it.src.height; }
+function strokeBB(it){ let x0=1/0,y0=1/0,x1=-1/0,y1=-1/0; for(const p of it.pts){ const pad=(p.w||it.base)/2; if(p.x-pad<x0)x0=p.x-pad; if(p.y-pad<y0)y0=p.y-pad; if(p.x+pad>x1)x1=p.x+pad; if(p.y+pad>y1)y1=p.y+pad; } if(!it.pts.length){x0=y0=x1=y1=0;} return {x0,y0,x1,y1}; }
+function itemBounds(it){
+  if(it.kind==="raster"){ const w=(it.src.width||1)*it.s,h=(it.src.height||1)*it.s; return {x0:it.x,y0:it.y,x1:it.x+w,y1:it.y+h}; }
+  if(it.kind==="shape"){ const p=it.base/2; return {x0:Math.min(it.x0,it.x1)-p,y0:Math.min(it.y0,it.y1)-p,x1:Math.max(it.x0,it.x1)+p,y1:Math.max(it.y0,it.y1)+p}; }
+  if(it.kind==="text"){ const m=textMetrics(it); return {x0:it.x,y0:it.y,x1:it.x+m.w,y1:it.y+m.h}; }
+  if(it.kind==="flownode"){ const p=it.base/2; return {x0:Math.min(it.x0,it.x1)-p,y0:Math.min(it.y0,it.y1)-p,x1:Math.max(it.x0,it.x1)+p,y1:Math.max(it.y0,it.y1)+p}; }
+  if(it.kind==="connector"){ const r=connectorRoute(it); if(!r) return {x0:0,y0:0,x1:0,y1:0};
+    let x0=1/0,y0=1/0,x1=-1/0,y1=-1/0; for(const q of r.points){ if(q.x<x0)x0=q.x; if(q.x>x1)x1=q.x; if(q.y<y0)y0=q.y; if(q.y>y1)y1=q.y; } return {x0,y0,x1,y1}; }
+  return it.bb || (it.bb=strokeBB(it));   // cached; invalidated on edit
+}
+/* ---------------- flowchart: nodes + connectors (Work mode) ----------------
+   A flownode is geometrically a "shape" (a bounding box) with a shape variant and a text
+   label, so it rides the existing shape/select/resize/undo machinery almost unchanged.
+   A connector stores no geometry of its own — only which two flownodes (by `fid`, stable
+   across moves/undo/reload) it joins and a `bend` fraction — so its route is recomputed
+   live from wherever those nodes currently are. fids are global (not per-frame) so a search
+   has to walk every frame, not just the current one — see findFlowNode. */
+function findFlowNode(fid){ for(const n of allNodes()) for(const it of n.items) if(it.kind==="flownode"&&it.fid===fid) return it; return null; }
+function normBox(it){ return {x0:Math.min(it.x0,it.x1),y0:Math.min(it.y0,it.y1),x1:Math.max(it.x0,it.x1),y1:Math.max(it.y0,it.y1)}; }
+function sideAnchor(box,side){ const cx=(box.x0+box.x1)/2,cy=(box.y0+box.y1)/2;
+  if(side==="left") return {x:box.x0,y:cy}; if(side==="right") return {x:box.x1,y:cy};
+  if(side==="top") return {x:cx,y:box.y0}; return {x:cx,y:box.y1}; }
+/* Orthogonal (elbow) route between two boxes: picks the exit/entry side from whichever axis
+   the boxes are more separated on, then a single bend segment along that axis at fraction
+   `bend` (0..1, draggable) — a straight 2-point line when they're already dead-aligned. */
+function routeBetween(boxA,boxB,bend){
+  const acx=(boxA.x0+boxA.x1)/2, acy=(boxA.y0+boxA.y1)/2, bcx=(boxB.x0+boxB.x1)/2, bcy=(boxB.y0+boxB.y1)/2;
+  const dx=bcx-acx, dy=bcy-acy;
+  // world coordinates are zoom-normalized (not fixed-size), so "already aligned" has to be judged
+  // relative to the boxes' own size, not an absolute epsilon — a fixed constant here collapsed
+  // routes to a straight line whenever camera zoom made the boxes tiny in world units.
+  const eps=Math.max(1e-6,Math.min(boxA.x1-boxA.x0,boxA.y1-boxA.y0,boxB.x1-boxB.x0,boxB.y1-boxB.y0)*0.05);
+  if(Math.abs(dx)>=Math.abs(dy)){
+    const fromSide=dx>=0?"right":"left", toSide=dx>=0?"left":"right";
+    const p1=sideAnchor(boxA,fromSide), p2=sideAnchor(boxB,toSide);
+    if(Math.abs(p1.y-p2.y)<eps) return {points:[p1,p2],fromSide,toSide};
+    const midX=p1.x+(p2.x-p1.x)*bend;
+    return {points:[p1,{x:midX,y:p1.y},{x:midX,y:p2.y},p2],fromSide,toSide};
+  }
+  const fromSide=dy>=0?"bottom":"top", toSide=dy>=0?"top":"bottom";
+  const p1=sideAnchor(boxA,fromSide), p2=sideAnchor(boxB,toSide);
+  if(Math.abs(p1.x-p2.x)<eps) return {points:[p1,p2],fromSide,toSide};
+  const midY=p1.y+(p2.y-p1.y)*bend;
+  return {points:[p1,{x:p1.x,y:midY},{x:p2.x,y:midY},p2],fromSide,toSide};
+}
+function connectorRoute(conn){ const a=findFlowNode(conn.fromId); if(!a) return null;
+  const bend=conn.bend==null?0.5:conn.bend;
+  if(conn.toId==null) return conn.toPoint?routeBetween(normBox(a),{x0:conn.toPoint.x,y0:conn.toPoint.y,x1:conn.toPoint.x,y1:conn.toPoint.y},bend):null;
+  const b=findFlowNode(conn.toId); if(!b) return null;
+  return routeBetween(normBox(a),normBox(b),bend); }
+const TEXT_FONT="ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif", TEXT_LH=1.28;
+function textFontStr(px){ return "600 "+px+"px "+TEXT_FONT; }
+function textLines(it){ return (it.text||"").split("\n"); }
+function textMetrics(it){                                                   // world-space width/height of the text, cached until the string changes
+  if(it._w!=null && it._mt===it.text) return {w:it._w,h:it._h};
+  ctx.save(); ctx.font=textFontStr(it.size); let w=0; for(const ln of textLines(it)) w=Math.max(w,ctx.measureText(ln||" ").width); ctx.restore();
+  it._w=Math.max(w,it.size*0.3); it._h=textLines(it).length*it.size*TEXT_LH; it._mt=it.text; return {w:it._w,h:it._h};
+}
+function bboxOf(node){
+  if(!node.dirty && node.bbox!==undefined) return node.bbox;
+  let b=null; const ex=(x0,y0,x1,y1)=>{ if(!b) b={x0,y0,x1,y1}; else{ if(x0<b.x0)b.x0=x0; if(y0<b.y0)b.y0=y0; if(x1>b.x1)b.x1=x1; if(y1>b.y1)b.y1=y1; } };
+  for(const it of node.items){ const r=itemBounds(it); ex(r.x0,r.y0,r.x1,r.y1); }
+  for(const c of node.children){ const cb=bboxOf(c.node); if(cb) ex(c.x+cb.x0*c.k,c.y+cb.y0*c.k,c.x+cb.x1*c.k,c.y+cb.y1*c.k); }
+  node.bbox=b; node.dirty=false; return b;
+}
+
+/* ---------------- rendering ---------------- */
+const nSX=(cam,x)=>(x-cam.x)*cam.scale+W/2, nSY=(cam,y)=>(y-cam.y)*cam.scale+H/2;
+/* A stroke/dab wider than a couple of viewports looks identical once it covers the
+   screen, but feeding the rasterizer an enormous (or fly-to-transient near-infinite)
+   width/radius can hang it — so we clamp draw widths without a size-based content cull. */
+const capPx=v=>{ const m=(W+H)*2; return v>m?m:v; };
+/* Item drawing targets `g` — normally the main ctx, but the offscreen layer while
+   an object is being rendered in isolation so its erase mask affects only itself. */
+/* `p.e` marks a point the eraser has (transiently, mid-drag) removed; the stroke is drawn
+   as the runs of surviving points, so a gap opens live where the brush passes. On commit
+   the runs become independent strokes (splitStroke) and the flags are gone. */
+function drawStrokeItem(it,cam){
+  const p=it.pts;
+  if(it.mode==="brush"){
+    g.fillStyle=it.color;
+    for(let i=0;i<p.length;i++){ if(p[i].e) continue;
+      if(i+1<p.length&&!p[i+1].e){
+        const ax=nSX(cam,p[i].x),ay=nSY(cam,p[i].y),bx=nSX(cam,p[i+1].x),by=nSY(cam,p[i+1].y);
+        const ra=capPx(Math.max(.4,p[i].w*cam.scale/2)), rb=capPx(Math.max(.4,p[i+1].w*cam.scale/2));
+        const dx=bx-ax,dy=by-ay,len=Math.hypot(dx,dy)||1, nx=-dy/len, ny=dx/len;
+        g.beginPath(); g.moveTo(ax+nx*ra,ay+ny*ra); g.lineTo(bx+nx*rb,by+ny*rb); g.lineTo(bx-nx*rb,by-ny*rb); g.lineTo(ax-nx*ra,ay-ny*ra); g.closePath(); g.fill();
+      }
+      g.beginPath(); g.arc(nSX(cam,p[i].x),nSY(cam,p[i].y),capPx(Math.max(.4,p[i].w*cam.scale/2)),0,6.2832); g.fill();
+    }
+    return;
+  }
+  const lw=capPx(Math.max(.4,it.base*cam.scale*(it.mode==="marker"?2.2:1)));
+  g.strokeStyle=it.color; g.lineWidth=lw; g.lineCap="round"; g.lineJoin="round"; g.fillStyle=it.color;
+  let i=0;
+  while(i<p.length){
+    if(p[i].e){ i++; continue; }
+    let j=i; while(j+1<p.length&&!p[j+1].e) j++;                              // run i..j of surviving points
+    if(i===j){ g.beginPath(); g.arc(nSX(cam,p[i].x),nSY(cam,p[i].y),lw/2,0,6.2832); g.fill(); }
+    else{ g.beginPath(); g.moveTo(nSX(cam,p[i].x),nSY(cam,p[i].y));
+      for(let k=i+1;k<j;k++){ const x=nSX(cam,p[k].x),y=nSY(cam,p[k].y),nx=nSX(cam,p[k+1].x),ny=nSY(cam,p[k+1].y); g.quadraticCurveTo(x,y,(x+nx)/2,(y+ny)/2); }
+      const L=p[j]; g.lineTo(nSX(cam,L.x),nSY(cam,L.y)); g.stroke(); }
+    i=j+1;
+  }
+}
+function drawShapeItem(it,cam){
+  const x0=nSX(cam,it.x0),y0=nSY(cam,it.y0),x1=nSX(cam,it.x1),y1=nSY(cam,it.y1);
+  g.strokeStyle=it.color; g.lineWidth=capPx(Math.max(.4,it.base*cam.scale)); g.lineCap="round"; g.lineJoin="round"; g.beginPath();
+  if(it.shape==="line"){ g.moveTo(x0,y0); g.lineTo(x1,y1); }
+  else if(it.shape==="rect"){ g.rect(Math.min(x0,x1),Math.min(y0,y1),Math.abs(x1-x0),Math.abs(y1-y0)); }
+  else { g.ellipse((x0+x1)/2,(y0+y1)/2,Math.abs(x1-x0)/2,Math.abs(y1-y0)/2,0,0,6.2832); }
+  g.stroke();
+}
+function drawRasterItem(it,cam){ if(!rasterOK(it)) return; const x=nSX(cam,it.x),y=nSY(cam,it.y),w=it.src.width*it.s*cam.scale,h=it.src.height*it.s*cam.scale; g.drawImage(it.src,x,y,w,h); }
+function drawEraseMask(e,cam){                                              // one erase polyline, punched via destination-out on `g`
+  const p=e.pts; if(!p.length) return;
+  g.save(); g.globalCompositeOperation="destination-out"; g.globalAlpha=1; g.fillStyle=g.strokeStyle="#000";
+  const lw=capPx(Math.max(1,e.base*cam.scale));
+  if(p.length===1){ g.beginPath(); g.arc(nSX(cam,p[0].x),nSY(cam,p[0].y),lw/2,0,6.2832); g.fill(); }
+  else { g.lineWidth=lw; g.lineCap="round"; g.lineJoin="round"; g.beginPath(); g.moveTo(nSX(cam,p[0].x),nSY(cam,p[0].y));
+    for(let i=1;i<p.length;i++) g.lineTo(nSX(cam,p[i].x),nSY(cam,p[i].y)); g.stroke(); }
+  g.restore();
+}
+function drawHoleMask(h,cam){                                               // one erase hole, punched via destination-out on `g`
+  g.save(); g.globalCompositeOperation="destination-out"; g.globalAlpha=1; g.fillStyle="#000";
+  g.beginPath(); g.arc(nSX(cam,h.x),nSY(cam,h.y),capPx(Math.max(.5,h.r*cam.scale)),0,6.2832); g.fill(); g.restore();
+}
+function drawClipMask(c,cam){                                               // one region-cut hole: a filled polygon punched via destination-out on `g`
+  const p=c.poly; if(!p||p.length<3) return;
+  g.save(); g.globalCompositeOperation="destination-out"; g.globalAlpha=1; g.fillStyle="#000";
+  g.beginPath(); g.moveTo(nSX(cam,p[0].x),nSY(cam,p[0].y));
+  for(let i=1;i<p.length;i++) g.lineTo(nSX(cam,p[i].x),nSY(cam,p[i].y)); g.closePath(); g.fill(); g.restore();
+}
+function drawKeepMask(poly,cam){                                            // clip the item INTO a polygon (keep only inside) via destination-in on `g`
+  if(!poly||poly.length<3) return;
+  g.save(); g.globalCompositeOperation="destination-in"; g.globalAlpha=1; g.fillStyle="#000";
+  g.beginPath(); g.moveTo(nSX(cam,poly[0].x),nSY(cam,poly[0].y));
+  for(let i=1;i<poly.length;i++) g.lineTo(nSX(cam,poly[i].x),nSY(cam,poly[i].y)); g.closePath(); g.fill(); g.restore();
+}
+function isMasked(it){ return (it.erases&&it.erases.length)||(it.holes&&it.holes.length)||(it.clips&&it.clips.length)||(it.keep&&it.keep.length); }
+function drawTextItem(it,cam){
+  const px=Math.max(1,it.size*cam.scale);
+  g.save(); g.font=textFontStr(px); g.fillStyle=it.color; g.textBaseline="top"; g.textAlign="left";
+  const x=nSX(cam,it.x), y=nSY(cam,it.y), lh=it.size*TEXT_LH*cam.scale, lines=textLines(it);
+  for(let i=0;i<lines.length;i++) g.fillText(lines[i], x, y+i*lh);
+  g.restore();
+}
+function wrapLines(g,text,maxW){
+  const words=(text||"").split(/\s+/).filter(Boolean); if(!words.length) return [""];
+  const lines=[]; let cur=words[0];
+  for(let i=1;i<words.length;i++){ const test=cur+" "+words[i]; if(g.measureText(test).width<=maxW) cur=test; else { lines.push(cur); cur=words[i]; } }
+  lines.push(cur); return lines;
+}
+function drawFlowNodeItem(it,cam){
+  const b=normBox(it), x0=nSX(cam,b.x0),y0=nSY(cam,b.y0),x1=nSX(cam,b.x1),y1=nSY(cam,b.y1), w=x1-x0, h=y1-y0;
+  g.lineWidth=capPx(Math.max(.4,it.base*cam.scale)); g.strokeStyle=it.color; g.fillStyle=it.fill||"rgba(255,255,255,.07)"; g.lineJoin="round";
+  g.beginPath();
+  if(it.shape==="ellipse") g.ellipse((x0+x1)/2,(y0+y1)/2,Math.max(0,w/2),Math.max(0,h/2),0,0,6.2832);
+  else if(it.shape==="diamond"){ g.moveTo((x0+x1)/2,y0); g.lineTo(x1,(y0+y1)/2); g.lineTo((x0+x1)/2,y1); g.lineTo(x0,(y0+y1)/2); g.closePath(); }
+  else g.rect(x0,y0,w,h);
+  g.fill(); g.stroke();
+  if(it.text&&it!==editingText){
+    const px=capPx(Math.max(1,h*0.28));   // scales purely with zoom, like every other vector item — no readability clamp pinning it in place
+    g.save(); g.font="600 "+px+"px "+TEXT_FONT; g.fillStyle=it.color; g.textAlign="center"; g.textBaseline="middle"; g.beginPath(); g.rect(x0,y0,w,h); g.clip();
+    const lines=wrapLines(g,it.text,Math.max(10,w-16)), lh=px*1.25, startY=(y0+y1)/2-(lines.length*lh)/2+lh/2;
+    for(let i=0;i<lines.length;i++) g.fillText(lines[i],(x0+x1)/2,startY+i*lh);
+    g.restore();
+  }
+}
+function drawConnectorItem(it,cam){
+  const r=connectorRoute(it); if(!r) return;
+  const lw=capPx(Math.max(.4,it.base*cam.scale)), p=r.points.map(q=>({x:nSX(cam,q.x),y:nSY(cam,q.y)}));
+  g.strokeStyle=it.color; g.fillStyle=it.color; g.lineWidth=lw; g.lineCap="round"; g.lineJoin="round";
+  g.beginPath(); g.moveTo(p[0].x,p[0].y); for(let i=1;i<p.length;i++) g.lineTo(p[i].x,p[i].y); g.stroke();
+  const tip=p[p.length-1], prev=p[p.length-2]; const a=Math.atan2(tip.y-prev.y,tip.x-prev.x), ah=Math.max(6,lw*2.4);
+  g.beginPath(); g.moveTo(tip.x,tip.y);
+  g.lineTo(tip.x-ah*Math.cos(a-0.5),tip.y-ah*Math.sin(a-0.5)); g.lineTo(tip.x-ah*Math.cos(a+0.5),tip.y-ah*Math.sin(a+0.5)); g.closePath(); g.fill();
+}
+function drawOneItem(it,cam){
+  if(it.kind==="stroke") drawStrokeItem(it,cam); else if(it.kind==="shape") drawShapeItem(it,cam); else if(it.kind==="text") drawTextItem(it,cam);
+  else if(it.kind==="flownode") drawFlowNodeItem(it,cam); else if(it.kind==="connector") drawConnectorItem(it,cam); else drawRasterItem(it,cam);
+}
+function itemScreenRect(it,cam){                                            // padded on-screen AABB (incl. erase width), clamped to viewport
+  const b=itemBounds(it); let pad=2; if(it.erases) for(const e of it.erases) pad=Math.max(pad,e.base*cam.scale/2+2);
+  if(it.holes) for(const h of it.holes) pad=Math.max(pad,h.r*cam.scale+2);
+  let minx=Math.min(nSX(cam,b.x0),nSX(cam,b.x1)),maxx=Math.max(nSX(cam,b.x0),nSX(cam,b.x1));
+  let miny=Math.min(nSY(cam,b.y0),nSY(cam,b.y1)),maxy=Math.max(nSY(cam,b.y0),nSY(cam,b.y1));
+  if(it.keep&&it.keep.length){                                             // a `keep` clip only shrinks the item — tighten the composite box to the kept polygon
+    let kx0=1/0,ky0=1/0,kx1=-1/0,ky1=-1/0; for(const q of it.keep){ const sx=nSX(cam,q.x),sy=nSY(cam,q.y); if(sx<kx0)kx0=sx; if(sx>kx1)kx1=sx; if(sy<ky0)ky0=sy; if(sy>ky1)ky1=sy; }
+    minx=Math.max(minx,kx0); maxx=Math.min(maxx,kx1); miny=Math.max(miny,ky0); maxy=Math.min(maxy,ky1);
+  }
+  const rx=Math.max(0,Math.floor(minx-pad)), ry=Math.max(0,Math.floor(miny-pad));
+  const rr=Math.min(W,Math.ceil(maxx+pad)), rb=Math.min(H,Math.ceil(maxy+pad));
+  return {x:rx,y:ry,w:rr-rx,h:rb-ry};
+}
+function drawItems(node,cam){
+  const hangCap=5e6;                                                       // NOT a visible clip plane: only rejects non-finite / astronomically large spans (transient fly-to spikes between distant depths). Real deep-zoom content always renders.
+  const lmap=new Map(gLayers.map(L=>[L.id,L]));                            // global layer lookup for visibility/opacity
+  for(const it of node.items){
+    if(it.dead||(it===editingText&&it.kind==="text")) continue;             // erased this drag, or a plain text item currently shown live in the text editor (a flownode being labelled still draws its box — see drawFlowNodeItem)
+    const L=lmap&&lmap.get(it.lyr); if(L&&!L.visible) continue;             // hidden layer
+    const lop=L?L.opacity:1;                                                // multiply item alpha by its layer's opacity
+    const ib=itemBounds(it);
+    if(!(Math.max(ib.x1-ib.x0,ib.y1-ib.y0)*cam.scale<hangCap)) continue;   // NaN/Infinity or absurd size would hang the rasterizer; LOD background fill still covers screen-wide coverage
+    // Item-level screen cull: skip anything whose on-screen box lies fully outside the viewport.
+    // itemBounds already includes point width for pens/brushes; pad extra for marker over-width,
+    // shape stroke, and erase spill so a thick body straddling the edge is never wrongly dropped.
+    let cpad=(it.base||0)*cam.scale*1.3+2;
+    if(it.erases) for(const e of it.erases) cpad=Math.max(cpad,e.base*cam.scale/2);
+    if(it.holes) for(const h of it.holes) cpad=Math.max(cpad,h.r*cam.scale);
+    const cx0=nSX(cam,ib.x0),cx1=nSX(cam,ib.x1),cy0=nSY(cam,ib.y0),cy1=nSY(cam,ib.y1);
+    if(Math.max(cx0,cx1)<-cpad||Math.min(cx0,cx1)>W+cpad||Math.max(cy0,cy1)<-cpad||Math.min(cy0,cy1)>H+cpad) continue;
+    if(!isMasked(it)){                                                      // fast path: no mask, draw straight to main ctx
+      g=ctx; ctx.globalAlpha=(it.alpha!=null?it.alpha:1)*lop; drawOneItem(it,cam); continue;
+    }
+    const r=itemScreenRect(it,cam); if(r.w<=0||r.h<=0) continue;            // fully offscreen
+    // Clear and copy the SAME integer device-pixel rect, sized to fully contain the (fractional)
+    // CSS clip rect. With a non-integer dpr (phones clamp to 2.5) the old round-based copy rect
+    // could poke past the cleared area and drag in stale `layer` pixels from an earlier erased
+    // item — a ghost. Flooring the origin and ceiling the far edge guarantees clear ⊇ copy.
+    const dx=Math.floor(r.x*dpr),dy=Math.floor(r.y*dpr),dw=Math.ceil((r.x+r.w)*dpr)-dx,dh=Math.ceil((r.y+r.h)*dpr)-dy;
+    g=lctx; lctx.setTransform(1,0,0,1,0,0); lctx.globalCompositeOperation="source-over"; lctx.globalAlpha=1; lctx.clearRect(dx,dy,dw,dh);
+    lctx.setTransform(dpr,0,0,dpr,0,0); lctx.save(); lctx.beginPath(); lctx.rect(r.x,r.y,r.w,r.h); lctx.clip();
+    drawOneItem(it,cam); if(it.erases) for(const e of it.erases) drawEraseMask(e,cam); if(it.holes) for(const h of it.holes) drawHoleMask(h,cam); if(it.clips) for(const c of it.clips) drawClipMask(c,cam); if(it.keep) drawKeepMask(it.keep,cam); lctx.restore();
+    g=ctx; ctx.save(); ctx.globalAlpha=(it.alpha!=null?it.alpha:1)*lop; ctx.globalCompositeOperation="source-over"; ctx.setTransform(1,0,0,1,0,0);
+    ctx.drawImage(layer,dx,dy,dw,dh,dx,dy,dw,dh); ctx.restore();
+  }
+  ctx.globalAlpha=1;
+}
+function renderNode(node,cam,depth){
+  drawItems(node,cam);
+  for(const child of node.children){
+    const cc={scale:cam.scale*child.k,x:(cam.x-child.x)/child.k,y:(cam.y-child.y)/child.k};
+    if(cc.scale<0.18||depth>=MAX_DEPTH) continue;
+    const b=bboxOf(child.node); if(!b) continue;                            // empty frame: nothing to draw, don't recurse
+    const X0=nSX(cc,b.x0),X1=nSX(cc,b.x1),Y0=nSY(cc,b.y0),Y1=nSY(cc,b.y1);
+    if(Math.max(X0,X1)<-60||Math.min(X0,X1)>W+60||Math.max(Y0,Y1)<-60||Math.min(Y0,Y1)>H+60) continue;
+    renderNode(child.node,cc,depth+1);
+  }
+}
+function renderScene(baseCam){
+  // climb up to UP_LEVELS ancestors so surrounding context stays visible through zoom transitions
+  let top=current, cam={x:baseCam.x,y:baseCam.y,scale:baseCam.scale};
+  for(let i=0;i<UP_LEVELS && top.up;i++){ const u=top.up; cam={scale:cam.scale/u.k,x:u.x+cam.x*u.k,y:u.y+cam.y*u.k}; top=u.parent; }
+  renderNode(top,cam,0);
+}
+/* ---------------- level-of-detail fill (infinite zoom) ----------------
+   When zoomed so deep that content lives beyond the rendered ancestor window, ray-cast
+   the viewport centre up the ancestor chain and fill the background with the colour of
+   the nearest item that fully covers the viewport (respecting erase holes). Content then
+   never vanishes — it stays until physically panned/zoomed out of view — and we never
+   draw extreme-coordinate geometry (which is what made a larger render window hang). */
+const px1=document.createElement("canvas"); px1.width=px1.height=1;
+const px1ctx=px1.getContext("2d",{willReadFrequently:true});
+function rasterPixelColor(it,ix,iy){ if(!rasterOK(it)) return null;
+  ix=Math.max(0,Math.min(it.src.width-1,ix)); iy=Math.max(0,Math.min(it.src.height-1,iy));
+  px1ctx.clearRect(0,0,1,1); try{ px1ctx.drawImage(it.src,ix,iy,1,1,0,0,1,1); }catch(e){ return null; }
+  const d=px1ctx.getImageData(0,0,1,1).data; return d[3]<8?null:`rgb(${d[0]},${d[1]},${d[2]})`;
+}
+/* State of a covering item's erase holes relative to the viewport:
+   'hole' = the whole viewport sits inside one hole (fully see-through — the item is off-screen);
+   'edge' = a hole crosses the viewport, so the item is a field with a hole in it (drawn as such by
+            drawLodCover — NOT punted to geometry, which is culled at this depth and would vanish);
+   ''     = solid across the whole viewport. */
+function eraseCoverState(it,px,py,marginW){
+  let edge=false;
+  if(it.erases) for(const e of it.erases){ const hw=e.base/2, p=e.pts;
+    for(let i=0;i<p.length;i++){ const d=(i+1<p.length)?segDist(px,py,p[i].x,p[i].y,p[i+1].x,p[i+1].y):Math.hypot(px-p[i].x,py-p[i].y);
+      if(d+marginW<=hw) return "hole";                                       // viewport wholly inside the erased band
+      if(d-hw<marginW) edge=true; } }                                        // erased band edge crosses the viewport
+  if(it.holes) for(const h of it.holes){ const d=Math.hypot(px-h.x,py-h.y);
+    if(d+marginW<=h.r) return "hole";                                        // viewport wholly inside the hole
+    if(d-h.r<marginW) edge=true; }                                          // hole edge crosses the viewport
+  return edge?"edge":"";
+}
+const EDGE={};   // coverColor sentinel: item covers the viewport but has a hole crossing it (partial cover)
+// undefined = item doesn't cover the viewport; null = covers but viewport is fully see-through; EDGE = holed cover; string = solid fill colour
+function coverColor(it,px,py,scale,marginW){
+  if(it.kind==="stroke"||(it.kind==="shape"&&it.shape==="line")){
+    if(it.base*scale<Math.hypot(W,H)) return undefined;                     // too thin on-screen to cover — quick reject
+    let d; if(it.kind==="stroke"){ const p=it.pts; d=Infinity;
+        for(let i=0;i<p.length;i++){ const dd=(i+1<p.length)?segDist(px,py,p[i].x,p[i].y,p[i+1].x,p[i+1].y):Math.hypot(px-p[i].x,py-p[i].y); if(dd<d)d=dd; } }
+      else d=segDist(px,py,it.x0,it.y0,it.x1,it.y1);
+    if(d+marginW>it.base/2) return undefined;                               // viewport not wholly inside the stroke body
+    const st=eraseCoverState(it,px,py,marginW); if(st==="hole") return null; if(st==="edge") return EDGE;
+    return it.color;
+  }
+  if(it.kind==="raster"){ const b=itemBounds(it);
+    if(px-b.x0<marginW||b.x1-px<marginW||py-b.y0<marginW||b.y1-py<marginW) return undefined;   // viewport not wholly inside image
+    const st=eraseCoverState(it,px,py,marginW); if(st==="hole") return null; if(st==="edge") return undefined;
+    return rasterPixelColor(it,Math.floor((px-it.x)/it.s),Math.floor((py-it.y)/it.s));
+  }
+  return undefined;                                                         // rect/ellipse outlines: no LOD fill
+}
+/* Returns the deep-zoom backdrop: a colour string (solid cover), null (paper), or a
+   {item,cam,behind} descriptor for a holed covering stroke — drawn by drawLodCover as a
+   flat field with its holes punched through to `behind`, so you can zoom into/through a
+   hole instead of the whole line vanishing when its geometry is culled at this depth. */
+function lodFill(){
+  let px=camX,py=camY,scale=camScale,node=current; const half=Math.hypot(W,H)/2;
+  let cover=null;                                                           // frontmost holed cover awaiting its backdrop
+  for(let L=0;L<48;L++){ const marginW=half/scale;                          // half-viewport, in this node's world units
+    for(let i=node.items.length-1;i>=0;i--){ const it=node.items[i]; if(it.dead) continue; const ly=layerOf(it); if(ly&&!ly.visible) continue; const c=coverColor(it,px,py,scale,marginW);
+      if(c===undefined||c===null) continue;                                 // see-through / no cover: keep looking behind
+      if(c===EDGE){ if(!cover) cover={item:it,cam:{x:px,y:py,scale}}; continue; }   // holed cover: remember frontmost, find what shows through the hole
+      return cover?{item:cover.item,cam:cover.cam,behind:c}:c;              // solid backdrop for the hole
+    }
+    if(!node.up) break; const up=node.up; px=up.x+px*up.k; py=up.y+py*up.k; scale/=up.k; node=up.parent;
+  }
+  return cover?{item:cover.item,cam:cover.cam,behind:null}:null;            // hole shows paper
+}
+function drawLodCover(f){                                                    // f={item,cam,behind}: flat field of item.color with its holes punched to `behind`
+  const it=f.item, cam=f.cam;
+  ctx.globalAlpha=1;
+  if(f.behind){ ctx.fillStyle=f.behind; ctx.fillRect(0,0,W,H); }            // what shows through the holes
+  lctx.setTransform(1,0,0,1,0,0); lctx.clearRect(0,0,layer.width,layer.height);
+  lctx.setTransform(dpr,0,0,dpr,0,0); lctx.globalCompositeOperation="source-over"; lctx.globalAlpha=1;
+  lctx.fillStyle=it.color; lctx.fillRect(0,0,W,H);                          // the covering ink, full viewport
+  const og=g; g=lctx;
+  if(it.holes) for(const h of it.holes) drawHoleMask(h,cam);                // punch the holes (destination-out)
+  if(it.erases) for(const e of it.erases) drawEraseMask(e,cam);
+  g=og;
+  ctx.save(); ctx.setTransform(1,0,0,1,0,0); ctx.globalAlpha=it.alpha!=null?it.alpha:1; ctx.drawImage(layer,0,0); ctx.restore();
+}
+/* ---------------- background grid (toggleable) ----------------
+   A graph-paper overlay anchored to the current frame's world coordinates, so it pans and
+   zooms with the drawing. Lines sit on decade lattices (multiples of a power of ten) and each
+   line's opacity is a smooth function of its *current* on-screen spacing: a decade fades in
+   from nothing as it spreads past ~18px and reaches full strength by ~180px, so the finer
+   decade grows in exactly as the coarser one is still there. Because opacity depends only on
+   the continuous spacing — never on a snapped "nice step" choice — the grid stays at a steady
+   on-screen density while zooming without any lines popping in or out, and coarser decades read
+   naturally as stronger guide lines. A `dots` mode marks intersections instead of full lines.
+   Drawn under the scene so ink sits on top, and baked into the frozen scene snapshot. */
+function drawGrid(){
+  if(!gridMode) return;
+  const target=46;                                                          // reference on-screen gap (px) for the base decade
+  const [br,bgc,bb]=hx(bgColor||"#f7f6f2");                                 // adapt to the canvas colour, like the cursor ring
+  const dark=(0.299*br+0.587*bgc+0.114*bb)<128, base=dark?"235,237,240":"35,37,43";
+  const Amax=0.15;                                                          // opacity of a fully spread-out (coarse guide) decade
+  // Opacity from on-screen spacing: 0 at ~0.4×target (too dense → hidden), Amax at ~4×target
+  // and above. The single continuous curve is what removes the snapping — as you zoom, every
+  // line's spacing drifts smoothly, so its opacity does too.
+  const alphaFor=sp=>Math.max(0,Math.min(1,Math.log10(sp/(target*0.4))))*Amax;
+  const S0=Math.pow(10,Math.ceil(Math.log10((target*0.4)/camScale)));       // finest decade worth drawing (sp ≳ 0.4×target)
+  const wx0=wX(0),wy0=wY(0),wx1=wX(W),wy1=wY(H);
+  ctx.save();
+  for(let L=3;L>=0;L--){                                                     // coarsest → finest, over ~4 decades
+    const step=S0*Math.pow(10,L), sp=step*camScale, a=alphaFor(sp);
+    if(a<=0.002) continue;
+    const skip=L<3;                                                          // lines on 10× multiples belong to a coarser decade already drawn
+    const i0=Math.floor(wx0/step), i1=Math.ceil(wx1/step);
+    const j0=Math.floor(wy0/step), j1=Math.ceil(wy1/step);
+    if(gridMode===2){                                                        // dots at intersections
+      ctx.fillStyle="rgba("+base+","+a.toFixed(3)+")"; const r=Math.min(1.6,Math.max(.8,sp*0.03));
+      for(let i=i0;i<=i1;i++){ const ix=i%10===0, x=sxNow(i*step);
+        for(let j=j0;j<=j1;j++){ if(skip&&ix&&j%10===0) continue; const y=syNow(j*step); ctx.beginPath(); ctx.arc(x,y,r,0,6.2832); ctx.fill(); } }
+    } else {                                                                 // lines
+      ctx.strokeStyle="rgba("+base+","+a.toFixed(3)+")"; ctx.lineWidth=1;
+      for(let i=i0;i<=i1;i++){ if(skip&&i%10===0) continue; const x=Math.round(sxNow(i*step))+.5;
+        ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
+      for(let j=j0;j<=j1;j++){ if(skip&&j%10===0) continue; const y=Math.round(syNow(j*step))+.5;
+        ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+    }
+  }
+  ctx.restore();
+}
+function renderWorld(){
+  ctx.clearRect(0,0,W,H);
+  const f=lodFill();
+  if(typeof f==="string"){ ctx.fillStyle=f; ctx.fillRect(0,0,W,H); }        // solid deep-zoom backdrop
+  else if(f){ drawLodCover(f); }                                            // holed covering stroke — keep it (and its hole) visible
+  drawGrid();
+  renderScene({x:camX,y:camY,scale:camScale});
+}
+/* Freeze the scene (minus the stroke about to start) into sceneSnap. The camera is static
+   for the whole of a one-finger draw, so during the drag we can just blit this snapshot and
+   paint the live stroke on top — one cheap frame instead of re-compositing the entire scene
+   every pointer move, which on a phone dropped/tore frames and left an offset ghost. */
+function snapshotScene(){ renderWorld(); snapCtx.setTransform(1,0,0,1,0,0); snapCtx.clearRect(0,0,sceneSnap.width,sceneSnap.height); snapCtx.drawImage(canvas,0,0); snapValid=true; }
+function draw(){
+  if(editingText) sizeTextEdit();                                          // keep the text editor glued to its item if the camera moves mid-edit
+  if((mode==="draw"||mode==="shape")&&draft&&snapValid){                    // active stroke: blit frozen scene, draw only the live stroke
+    ctx.setTransform(1,0,0,1,0,0); ctx.clearRect(0,0,canvas.width,canvas.height); ctx.drawImage(sceneSnap,0,0); ctx.setTransform(dpr,0,0,dpr,0,0);
+    const cam={x:camX,y:camY,scale:camScale}; g=ctx; ctx.globalCompositeOperation="source-over"; ctx.globalAlpha=draft.alpha!=null?draft.alpha:1;
+    if(draft.kind==="stroke") drawStrokeItem(draft,cam); else drawShapeItem(draft,cam);
+    for(const md of mirrorDrafts){ ctx.globalAlpha=md.item.alpha!=null?md.item.alpha:1; drawStrokeItem(md.item,cam); }
+    ctx.globalAlpha=1; drawMirrorGuide(); drawCursorRing(); return;
+  }
+  renderWorld();
+  if(previewRect){ ctx.strokeStyle=ACCENT; ctx.setLineDash([7,5]); ctx.lineWidth=1.5; ctx.strokeRect(previewRect.x,previewRect.y,previewRect.w,previewRect.h); ctx.setLineDash([]); }
+  if(tool==="select"&&selected&&current.items.indexOf(selected)>=0) drawSelection();
+  if(tool==="select"&&groupSel) drawGroupSelection();
+  if(mode==="region"&&regionDraft) drawRegionMarquee();
+  drawMirrorGuide();
+  if(tool==="loupe") drawLoupe();
+  drawCursorRing();
+}
+function drawRegionMarquee(){
+  const rd=regionDraft; if(!rd) return;
+  ctx.save(); ctx.strokeStyle=ACCENT; ctx.lineWidth=1.5; ctx.setLineDash([6,4]); ctx.fillStyle="rgba(45,212,191,.09)"; ctx.beginPath();
+  if(rd.shape==="lasso"){ const p=rd.pts; if(p.length){ ctx.moveTo(p[0].x,p[0].y); for(let i=1;i<p.length;i++) ctx.lineTo(p[i].x,p[i].y); ctx.closePath(); } }
+  else { const x0=Math.min(rd.x0,rd.x1),x1=Math.max(rd.x0,rd.x1),y0=Math.min(rd.y0,rd.y1),y1=Math.max(rd.y0,rd.y1);
+    if(rd.shape==="ellipse") ctx.ellipse((x0+x1)/2,(y0+y1)/2,(x1-x0)/2,(y1-y0)/2,0,0,6.2832); else ctx.rect(x0,y0,x1-x0,y1-y0); }
+  ctx.fill(); ctx.stroke(); ctx.setLineDash([]); ctx.restore();
+}
+let loupeMag=2.5, lastPointerType="mouse"; const LOUPE_MIN=1.2, LOUPE_MAX=80;
+function loupeLabel(){ return (loupeMag>=10?Math.round(loupeMag):loupeMag.toFixed(1))+"×"; }
+function adjustLoupe(f){ loupeMag=Math.max(LOUPE_MIN,Math.min(LOUPE_MAX,loupeMag*f)); if(!cursor) hintFlash("Magnifier "+loupeLabel()); dirty=true; }
+function drawLoupe(){
+  if(!cursor||spaceHeld||mode==="pan"||mode==="pinch"||mode==="move"||mode==="resize") return;
+  const R=Math.min(96,VIEW*0.16), touch=lastPointerType==="touch";
+  const wx=wX(cursor.x), wy=wY(cursor.y);   // the world point being inspected (under finger/cursor)
+  let cx=cursor.x, cy=cursor.y;
+  if(touch){                                 // lift the lens clear of the fingertip
+    const OFF=R+42; cy=cursor.y-OFF;
+    if(cy-R<8) cy=cursor.y+OFF;              // flip below when too close to the top edge
+  }
+  ctx.save();
+  ctx.beginPath(); ctx.arc(cx,cy,R,0,6.2832);
+  ctx.fillStyle=bgColor||"#f7f6f2"; ctx.fill();   // opaque paper (matches canvas colour) so the lens reads as its own surface
+  ctx.clip();
+  ctx.translate(cx-W/2,cy-H/2);              // map the inspected point to the lens centre
+  renderScene({x:wx,y:wy,scale:camScale*loupeMag});
+  ctx.restore();
+  ctx.beginPath(); ctx.arc(cx,cy,R,0,6.2832); ctx.strokeStyle="rgba(20,22,28,.55)"; ctx.lineWidth=3; ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx,cy,R,0,6.2832); ctx.strokeStyle=ACCENT; ctx.lineWidth=1.5; ctx.stroke();
+  if(touch){                                 // mark the real spot under the finger, away from the lens
+    ctx.beginPath(); ctx.arc(cursor.x,cursor.y,7,0,6.2832); ctx.strokeStyle=ACCENT; ctx.lineWidth=2; ctx.stroke();
+    ctx.beginPath(); ctx.arc(cursor.x,cursor.y,1.6,0,6.2832); ctx.fillStyle=ACCENT; ctx.fill();
+  } else {
+    ctx.strokeStyle="rgba(20,22,28,.35)"; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(cx-6,cy); ctx.lineTo(cx+6,cy); ctx.moveTo(cx,cy-6); ctx.lineTo(cx,cy+6); ctx.stroke();
+  }
+  const label=loupeLabel();                  // current magnification, pinned to the bottom of the lens
+  ctx.font="600 12px ui-sans-serif,system-ui,-apple-system,sans-serif"; ctx.textAlign="center"; ctx.textBaseline="middle";
+  const pw=ctx.measureText(label).width+14, ph=19, ly2=cy+R-16;
+  ctx.fillStyle="rgba(20,22,28,.75)"; ctx.beginPath();
+  if(ctx.roundRect) ctx.roundRect(cx-pw/2,ly2-ph/2,pw,ph,9); else ctx.rect(cx-pw/2,ly2-ph/2,pw,ph);
+  ctx.fill(); ctx.fillStyle="#eef0f4"; ctx.fillText(label,cx,ly2+0.5);
+  ctx.textAlign="start"; ctx.textBaseline="alphabetic";
+}
+function drawSelection(){
+  if(selected.kind==="connector"){                                          // highlight the route itself, plus a bend handle on its draggable middle segment
+    const route=connectorRoute(selected); if(!route) return;
+    ctx.strokeStyle=ACCENT; ctx.lineWidth=3; ctx.lineCap="round"; ctx.lineJoin="round"; ctx.setLineDash([]);
+    ctx.beginPath(); ctx.moveTo(sxNow(route.points[0].x),syNow(route.points[0].y));
+    for(let i=1;i<route.points.length;i++) ctx.lineTo(sxNow(route.points[i].x),syNow(route.points[i].y)); ctx.stroke();
+    if(route.points.length===4){ const m0=route.points[1], m1=route.points[2];
+      const hx=sxNow((m0.x+m1.x)/2), hy=syNow((m0.y+m1.y)/2);
+      ctx.fillStyle="#fff"; ctx.beginPath(); ctx.arc(hx,hy,6,0,6.2832); ctx.fill(); ctx.stroke(); }
+    return;
+  }
+  const b=itemBounds(selected);
+  const cx=[sxNow(b.x0),sxNow(b.x1),sxNow(b.x1),sxNow(b.x0)], cy=[syNow(b.y0),syNow(b.y0),syNow(b.y1),syNow(b.y1)];
+  ctx.strokeStyle=ACCENT; ctx.lineWidth=1.5; ctx.setLineDash([]);
+  ctx.beginPath(); ctx.moveTo(cx[0],cy[0]); for(let i=1;i<4;i++) ctx.lineTo(cx[i],cy[i]); ctx.closePath(); ctx.stroke();
+  for(let i=0;i<4;i++){ ctx.fillStyle="#fff"; ctx.beginPath(); ctx.rect(cx[i]-5,cy[i]-5,10,10); ctx.fill(); ctx.stroke(); }
+}
+function drawGroupSelection(){                                             // floating region-cut selection: the cut outline + a bbox with resize handles
+  const poly=groupSel.poly; if(!poly||poly.length<3) return;
+  ctx.save();
+  ctx.strokeStyle=ACCENT; ctx.lineWidth=1.5; ctx.setLineDash([6,4]);
+  ctx.beginPath(); ctx.moveTo(sxNow(poly[0].x),syNow(poly[0].y)); for(let i=1;i<poly.length;i++) ctx.lineTo(sxNow(poly[i].x),syNow(poly[i].y)); ctx.closePath(); ctx.stroke();
+  ctx.setLineDash([]);
+  const b=polyBBox(poly), cx=[sxNow(b.x0),sxNow(b.x1),sxNow(b.x1),sxNow(b.x0)], cy=[syNow(b.y0),syNow(b.y0),syNow(b.y1),syNow(b.y1)];
+  for(let i=0;i<4;i++){ ctx.fillStyle="#fff"; ctx.beginPath(); ctx.rect(cx[i]-5,cy[i]-5,10,10); ctx.fill(); ctx.stroke(); }
+  ctx.restore();
+}
+function drawMirrorGuide(){                                                  // dashed line(s) marking the symmetry axis, fixed at the view centre
+  if(mirrorMode==="off") return;
+  ctx.save(); ctx.strokeStyle=ACCENT; ctx.globalAlpha=.4; ctx.lineWidth=1; ctx.setLineDash([7,6]);
+  if(mirrorMode==="v"||mirrorMode==="both"){ ctx.beginPath(); ctx.moveTo(W/2,0); ctx.lineTo(W/2,H); ctx.stroke(); }
+  if(mirrorMode==="h"||mirrorMode==="both"){ ctx.beginPath(); ctx.moveTo(0,H/2); ctx.lineTo(W,H/2); ctx.stroke(); }
+  ctx.restore();
+}
+function drawCursorRing(){
+  if(!cursor||mode==="pan"||mode==="pinch"||mode==="move"||mode==="resize") return;
+  if(tool==="hand"||spaceHeld||tool==="image"||tool==="select"||tool==="loupe"||tool==="region"||tool==="text"||tool==="eyedrop") return;
+  const r=Math.max(2, size*(tool==="marker"?2.2:1)/2);   // on-screen brush is always `size` px
+  const [br,bg,bb]=hx(bgColor||"#f7f6f2");                // adapt the ring to the canvas colour so it stays visible on a dark background
+  const dark=(0.299*br+0.587*bg+0.114*bb)<128;
+  ctx.beginPath(); ctx.arc(cursor.x,cursor.y,r,0,6.2832);
+  ctx.strokeStyle=dark?"rgba(235,237,240,.55)":"rgba(35,37,43,.4)"; ctx.lineWidth=1; ctx.stroke();
+}
+
+/* ---------------- rebasing (hidden engine) ---------------- */
+function descendInto(c){ camScale*=c.k; targetScale*=c.k; camX=(camX-c.x)/c.k; camY=(camY-c.y)/c.k; current=c.node; selected=null; }
+function ascend(){ const up=current.up; camScale/=up.k; targetScale/=up.k; camX=up.x+camX*up.k; camY=up.y+camY*up.k; current=up.parent; selected=null; }
+function addChild(parent,x,y,k){ const node=makeNode(),child={x,y,k,node,parent}; node.up=child; parent.children.push(child); markDirty(parent); return child; }
+/* allowCreate: only true when the user actually starts drawing at deep zoom. Zooming/panning
+   alone never spawns an empty child frame (which would swap the Layers panel out from under
+   the drawing you can still see) — we only descend into child frames that already exist. */
+function reframe(allowCreate){
+  let guard=0;
+  while(guard++<40){
+    if(camScale>=VIEW){
+      let best=null;
+      for(const c of current.children){ if(Math.abs(camX-c.x)<=c.k/2&&Math.abs(camY-c.y)<=c.k/2){ const on=c.k*camScale; if(on>=VIEW&&(!best||on>best.on)) best={c,on}; } }
+      if(best){ descendInto(best.c); continue; }
+      if(allowCreate && camScale>=VIEW/CHILD_K && !anim){ descendInto(addChild(current,camX,camY,CHILD_K)); continue; }
+    }
+    if(current.up){ if(camScale<=VIEW*current.up.k){ ascend(); continue; } }
+    else if(camScale<=VIEW*CHILD_K && !anim){ const parent=makeNode(),child={x:0,y:0,k:CHILD_K,node:current,parent}; current.up=child; parent.children.push(child); root=parent; markDirty(parent); ascend(); continue; }
+    break;
+  }
+}
+
+/* ---------------- physics ---------------- */
+function physics(dt){
+  if(mode!==null) return;
+  if(Math.abs(Math.log(targetScale/camScale))>1e-4){
+    const awx=wX(anchorSX),awy=wY(anchorSY), t=1-Math.exp(-dt/ZTAU);
+    camScale*=Math.pow(targetScale/camScale,t);
+    camX=awx-(anchorSX-W/2)/camScale; camY=awy-(anchorSY-H/2)/camScale; reframe(); dirty=true;
+  }
+  if(Math.abs(pVel.x)>2||Math.abs(pVel.y)>2){ camX-=pVel.x*dt/camScale; camY-=pVel.y*dt/camScale; const d=Math.exp(-dt/PTAU); pVel.x*=d; pVel.y*=d; dirty=true; }
+  else { pVel.x=pVel.y=0; }
+}
+function loop(){ const now=performance.now(); const dt=Math.min(0.05,(now-lastT)/1000)||0.016; lastT=now; if(anim) stepAnim(now); else physics(dt);
+  if(dirty){ draw(); dirty=false; } requestAnimationFrame(loop); }   // layers are global now, so no per-frame panel refresh on rebasing
+
+/* ---------------- zoom ---------------- */
+function wheelZoom(px,py,mult){ anchorSX=px; anchorSY=py; targetScale=Math.max(camScale*1e-3,Math.min(camScale*1e3,targetScale*mult)); }
+function zoomCenter(f){ anchorSX=W/2; anchorSY=H/2; targetScale*=f; }
+function zoomAction(f){ anim=null; if(tool==="loupe") adjustLoupe(f); else { zoomCenter(f); scheduleSave(); } }   // + / - controls lens mag when the loupe is active
+
+/* ---------------- fly-to outer / inner drawing ----------------
+   Content lives at many nesting depths; a node's depth is captured by K, the product of
+   child `k` factors from root down to it (root=1, deeper = smaller). We frame the
+   shallowest node with its own drawing (outer) or the deepest (inner), then animate the
+   camera there. All interpolation happens in the TARGET node's local frame, which is
+   invariant to rebasing: each frame we load the eased camera into that frame and let
+   reframe() re-normalise for rendering, so numbers stay sane at any depth. */
+function nodeToRoot(node){ let ox=0,oy=0,K=1,n=node; while(n.up){ const c=n.up; ox=c.x+ox*c.k; oy=c.y+oy*c.k; K*=c.k; n=c.parent; } return {ox,oy,K}; }
+function ownBBox(node,lid){ let b=null; for(const it of node.items){ if(lid!=null && it.lyr!==lid) continue; const r=itemBounds(it);
+  if(!b) b={x0:r.x0,y0:r.y0,x1:r.x1,y1:r.y1};
+  else{ if(r.x0<b.x0)b.x0=r.x0; if(r.y0<b.y0)b.y0=r.y0; if(r.x1>b.x1)b.x1=r.x1; if(r.y1>b.y1)b.y1=r.y1; } }
+  return b; }
+/* Nodes holding a drawing (optionally restricted to items on layer `lid`), each with its depth K. */
+function nodesWithItems(lid){ const out=[]; (function rec(n,K){ const has=lid!=null?n.items.some(it=>it.lyr===lid):n.items.length;
+  if(has) out.push({node:n,K}); for(const c of n.children) rec(c.node,K*c.k); })(root,1); return out; }
+/* Set of layer ids that have at least one item somewhere in the tree (drives the per-layer fly-to buttons). */
+function layersWithItems(){ const s=new Set(); (function rec(n){ for(const it of n.items) s.add(it.lyr); for(const c of n.children) rec(c.node); })(root); return s; }
+const easeInOut=t=>t<0.5?4*t*t*t:1-Math.pow(-2*t+2,3)/2;
+function frameToNode(target,lid){
+  const bbox=ownBBox(target,lid); if(!bbox) return;
+  const bw=Math.max(1e-9,bbox.x1-bbox.x0), bh=Math.max(1e-9,bbox.y1-bbox.y0);
+  const s1=Math.min(W/bw,H/bh)*0.82, cx1=(bbox.x0+bbox.x1)/2, cy1=(bbox.y0+bbox.y1)/2;   // frame it into ~82% of the viewport
+  const cur=nodeToRoot(current), tgt=nodeToRoot(target), s=cur.K/tgt.K;                   // current camera, re-expressed in target-local
+  const cx0=(cur.ox-tgt.ox)/tgt.K+camX*s, cy0=(cur.oy-tgt.oy)/tgt.K+camY*s, s0=camScale/s;
+  const ls0=Math.log(s0), ls1=Math.log(s1);
+  const ax=s1>=s0?cx1:cx0, ay=s1>=s0?cy1:cy0;         // anchor on the more zoomed-in endpoint (the "small" point): destination for a fly-in, start for a fly-out
+  const p0x=(ax-cx0)*s0+W/2, p0y=(ay-cy0)*s0+H/2;     // where the anchor sits on screen at the start...
+  const p1x=(ax-cx1)*s1+W/2, p1y=(ay-cy1)*s1+H/2;     // ...and at the destination; we ease between while zooming around it
+  const dur=Math.max(380,Math.min(2600, Math.abs(ls1-ls0)/FLY_EFOLDS_PER_SEC*1000));   // constant zoom rate: duration scales with log-distance travelled
+  anim={node:target,ax,ay,p0x,p0y,p1x,p1y,ls0,ls1,t0:performance.now(),dur};
+  dirty=true;
+}
+function zoomToExtreme(outer,lid){
+  const list=nodesWithItems(lid); if(!list.length){ hintFlash(lid!=null?"This layer has no drawing yet":"Nothing to zoom to yet"); return; }
+  let best=list[0]; for(const e of list){ if(outer?e.K>best.K:e.K<best.K) best=e; }
+  pVel.x=pVel.y=0; frameToNode(best.node,lid);
+}
+function stepAnim(now){
+  const u=Math.min(1,(now-anim.t0)/anim.dur), e=easeInOut(u);
+  const scale=Math.exp(anim.ls0+(anim.ls1-anim.ls0)*e);
+  const px=anim.p0x+(anim.p1x-anim.p0x)*e, py=anim.p0y+(anim.p1y-anim.p0y)*e;   // ease the anchor's screen position along its endpoints
+  current=anim.node; camScale=scale; targetScale=scale;
+  camX=anim.ax-(px-W/2)/scale; camY=anim.ay-(py-H/2)/scale;           // zoom anchored on the "small" endpoint keeps it framed both ways
+  if(u>=1){ anim=null; scheduleSave(); }   // clear before reframe() so normal rebasing (descend into existing frames) resumes on the final frame
+  reframe(); dirty=true;
+}
+
+/* ---------------- history ---------------- */
+function pushHist(op){ history.push(op); future.length=0; updateHist(); scheduleSave(); }
+function applyRemove(node,it){ const i=node.items.indexOf(it); if(i>=0) node.items.splice(i,1); markDirty(node); }
+function undo(){ const op=history.pop(); if(!op) return;
+  if(op.type==="add") applyRemove(op.node,op.item);
+  else if(op.type==="erase"){ for(const r of op.removed) op.node.items.splice(Math.min(r.i,op.node.items.length),0,r.item); markDirty(op.node); }
+  else if(op.type==="verase"){ for(const c of op.itemChanges){ c.node.items=c.before.slice(); markDirty(c.node); }
+    for(let i=op.removed.length-1;i>=0;i--){ const r=op.removed[i]; r.parent.children.splice(r.index,0,r.child); markDirty(r.parent); } }   // re-attach pruned frames
+  else if(op.type==="transform"){ setGeom(op.item,op.before); markDirty(op.node); }
+  else if(op.type==="items"){ op.node.items=op.before.slice(); markDirty(op.node); }
+  else if(op.type==="layers"){ restoreLayerState(op.before); }
+  groupSel=null; future.push(op); updateHist(); dirty=true; scheduleSave(); refreshLayers(); }
+function redo(){ const op=future.pop(); if(!op) return;
+  if(op.type==="add"){ addItemTo(op.node,op.item,op.item.lyr); markDirty(op.node); }
+  else if(op.type==="erase"){ for(const r of [...op.removed].sort((a,b)=>b.i-a.i)){ const i=op.node.items.indexOf(r.item); if(i>=0) op.node.items.splice(i,1);} markDirty(op.node); }
+  else if(op.type==="verase"){ for(const c of op.itemChanges){ c.node.items=c.after.slice(); markDirty(c.node); }
+    for(const r of op.removed){ const i=r.parent.children.indexOf(r.child); if(i>=0) r.parent.children.splice(i,1); markDirty(r.parent); } }   // re-prune emptied frames
+  else if(op.type==="transform"){ setGeom(op.item,op.after); markDirty(op.node); }
+  else if(op.type==="items"){ op.node.items=op.after.slice(); markDirty(op.node); }
+  else if(op.type==="layers"){ restoreLayerState(op.after); }
+  groupSel=null; history.push(op); updateHist(); dirty=true; scheduleSave(); refreshLayers(); }
+function updateHist(){ document.getElementById("undo").disabled=!history.length; document.getElementById("redo").disabled=!future.length; }
+
+/* ---------------- pointer / drawing ---------------- */
+const local=e=>{ const r=canvas.getBoundingClientRect(); return {x:e.clientX-r.left,y:e.clientY-r.top}; };
+const baseWorld=()=>size/camScale;
+let lastMoveT=0,lastW=0;
+function brushWidth(e,speed){
+  const base=baseWorld(); let scale;
+  if(e && e.pointerType==="pen" && e.pressure>0) scale=0.22+1.7*e.pressure;   // real stylus pressure
+  else scale=1.35-Math.min(1,speed/2.2)*0.95;                                  // mouse: faster = thinner
+  const target=base*Math.max(0.1,scale); lastW=lastW?lastW*0.5+target*0.5:target; return lastW;
+}
+/* Symmetry drawing: mirrorMode picks which extra transforms ride alongside the pen/brush/
+   marker draft, reflected across an axis pinned to the view centre at the moment the stroke
+   started. Each extra copy is a REAL sibling stroke (added to current.items immediately,
+   same as the primary draft) rather than a derived/rendered effect, so once committed they're
+   ordinary independent strokes — movable, erasable, undoable — with no special-casing needed
+   anywhere else in the app. */
+function mirrorTypesFor(m){ return m==="v"?["v"]:m==="h"?["h"]:m==="both"?["v","h","vh"]:[]; }
+function mirrorXY(x,y,type,cx,cy){
+  if(type==="v") return {x:2*cx-x,y};
+  if(type==="h") return {x,y:2*cy-y};
+  return {x:2*cx-x,y:2*cy-y};   // "vh": both flips combined — the diagonal copy in 4-way mode
+}
+function startStroke(p,m,e){
+  const types=(m==="pen"||m==="brush"||m==="marker")?mirrorTypesFor(mirrorMode):[];
+  mirrorDrafts=[]; mirrorBefore=types.length?current.items.map(cloneItem):null;
+  mirrorCX=camX; mirrorCY=camY;
+  const it={kind:"stroke",mode:m,color,alpha:m==="marker"?0.32*opacity:(m==="brush"?1:opacity),base:baseWorld(),pts:[{x:wX(p.x),y:wY(p.y),w:brushWidth(e,0)}]};
+  it.bb=strokeBB(it); addItemTo(current,it); draft=it;
+  for(const type of types){
+    const mp=it.pts.map(q=>({...mirrorXY(q.x,q.y,type,mirrorCX,mirrorCY),w:q.w}));
+    const mit={kind:"stroke",mode:m,color:it.color,alpha:it.alpha,base:it.base,pts:mp};
+    mit.bb=strokeBB(mit); addItemTo(current,mit,it.lyr); mirrorDrafts.push({type,item:mit});
+  }
+  markDirty(current); dirty=true;
+}
+function extendStroke(p,e){
+  if(!draft) return; const last=draft.pts[draft.pts.length-1]; let wx=wX(p.x),wy=wY(p.y);
+  if(smoothing>0){ wx=last.x+(wx-last.x)*(1-smoothing); wy=last.y+(wy-last.y)*(1-smoothing); }   // stabiliser: ease toward the raw point
+  const distS=Math.hypot(sxNow(wx)-sxNow(last.x),syNow(wy)-syNow(last.y));
+  const now=performance.now(), dt=Math.max(1,now-lastMoveT); lastMoveT=now;
+  const dx=wx-last.x,dy=wy-last.y, m=0.5/camScale;
+  if(dx*dx+dy*dy>m*m){ const w=draft.mode==="brush"?brushWidth(e,distS/dt):draft.base; draft.pts.push({x:wx,y:wy,w}); const bb=draft.bb, pd=w/2; if(bb){ if(wx-pd<bb.x0)bb.x0=wx-pd; if(wy-pd<bb.y0)bb.y0=wy-pd; if(wx+pd>bb.x1)bb.x1=wx+pd; if(wy+pd>bb.y1)bb.y1=wy+pd; }
+    for(const md of mirrorDrafts){ const q=mirrorXY(wx,wy,md.type,mirrorCX,mirrorCY); md.item.pts.push({x:q.x,y:q.y,w});
+      const mbb=md.item.bb; if(mbb){ if(q.x-pd<mbb.x0)mbb.x0=q.x-pd; if(q.y-pd<mbb.y0)mbb.y0=q.y-pd; if(q.x+pd>mbb.x1)mbb.x1=q.x+pd; if(q.y+pd>mbb.y1)mbb.y1=q.y+pd; } }
+    markDirty(current); dirty=true; }
+}
+function startShape(p,shape){ const it={kind:"shape",shape,color,alpha:opacity,base:baseWorld(),x0:wX(p.x),y0:wY(p.y),x1:wX(p.x),y1:wY(p.y)}; addItemTo(current,it); draft=it; markDirty(current); dirty=true; }
+function startFlowNode(p){ const it={kind:"flownode",fid:++flowIdCtr,shape:flowShape,color,fill:"rgba(255,255,255,.07)",alpha:1,base:baseWorld(),x0:wX(p.x),y0:wY(p.y),x1:wX(p.x),y1:wY(p.y),text:""}; addItemTo(current,it); draft=it; markDirty(current); dirty=true; }
+function extendShape(p){ if(!draft) return; draft.x1=wX(p.x); draft.y1=wY(p.y); markDirty(current); dirty=true; }
+/* Connect tool: drag from one flownode to another. The draft is a real connector item from
+   the first pointerdown (so it renders through the normal pipeline like any other draft) —
+   `toId` stays null and `toPoint` tracks the raw pointer world position until it lands on a
+   second, different node at release, at which point commitDraft swaps toPoint for a real toId. */
+function startConnect(p){ const n=pickFlowNode(p.x,p.y); if(!n){ draft=null; return; }
+  const it={kind:"connector",fid:++flowIdCtr,fromId:n.fid,toId:null,toPoint:{x:wX(p.x),y:wY(p.y)},bend:0.5,color,base:baseWorld()};
+  addItemTo(current,it); draft=it; markDirty(current); dirty=true; }
+function extendConnect(p){ if(!draft) return; draft.toPoint={x:wX(p.x),y:wY(p.y)}; markDirty(current); dirty=true; }
+function commitDraft(){ if(!draft) return; const d=draft; draft=null; lastW=0; snapValid=false;
+  const mds=mirrorDrafts, before=mirrorBefore; mirrorDrafts=[]; mirrorBefore=null;
+  if((d.kind==="shape"||d.kind==="flownode")&&Math.hypot(sxNow(d.x1)-sxNow(d.x0),syNow(d.y1)-syNow(d.y0))<3){ applyRemove(current,d); for(const md of mds) applyRemove(current,md.item); return; }
+  if(d.kind==="connector"){
+    const target=cursor?pickFlowNode(cursor.x,cursor.y):null;
+    if(!target||target.fid===d.fromId){ applyRemove(current,d); return; }
+    d.toId=target.fid; delete d.toPoint;
+  }
+  if(mds.length) pushHist({type:"items",node:current,before,after:current.items.map(cloneItem)});   // mirrored copies land in one atomic undo step
+  else pushHist({type:"add",node:current,item:d});
+  if(d.kind==="flownode") beginEditText(d,true);   // straight into labelling — typing a name is the next natural step after drawing a node
+}
+
+/* Vector eraser: an erase drag deletes the geometry under the brush. Strokes lose the
+   sample points inside the brush disk and split into independent sub-strokes across the
+   gaps; shapes/images are removed whole when the brush touches them. Nothing is composited
+   per frame (so it stays fast on mobile), and once a frame is emptied it is pruned.
+   Width lives in world units, so zooming in erases arbitrarily fine detail. */
+function eraseWorldW(){ return Math.max(4,size)/camScale; }                 // eraser diameter, screen-constant, in world units
+function eraserTouches(it,ex,ey,R){                                         // does the eraser disk (world) overlap the object's painted body?
+  const b=itemBounds(it);
+  if(ex<b.x0-R||ex>b.x1+R||ey<b.y0-R||ey>b.y1+R) return false;             // broad phase
+  if(it.kind==="raster"||it.kind==="text") return true;                     // within the image rect / label box — no finer geometry to test against
+  if(it.kind==="flownode"){                                                 // filled node — touches anywhere inside its box, like a raster
+    const hw=(it.base||0)/2+R;
+    const minx=Math.min(it.x0,it.x1),maxx=Math.max(it.x0,it.x1),miny=Math.min(it.y0,it.y1),maxy=Math.max(it.y0,it.y1);
+    return ex>=minx-hw&&ex<=maxx+hw&&ey>=miny-hw&&ey<=maxy+hw;
+  }
+  if(it.kind==="connector"){
+    const r=connectorRoute(it); if(!r) return false;
+    const hw=(it.base||1)/2+R;
+    for(let i=0;i+1<r.points.length;i++){ if(segDist(ex,ey,r.points[i].x,r.points[i].y,r.points[i+1].x,r.points[i+1].y)<=hw) return true; }
+    return false;
+  }
+  if(it.kind==="shape"){
+    const hw=(it.base||1)/2+R;
+    if(it.shape==="line") return segDist(ex,ey,it.x0,it.y0,it.x1,it.y1)<=hw;
+    const minx=Math.min(it.x0,it.x1),maxx=Math.max(it.x0,it.x1),miny=Math.min(it.y0,it.y1),maxy=Math.max(it.y0,it.y1);
+    return (ex>=minx-hw&&ex<=maxx+hw&&ey>=miny-hw&&ey<=maxy+hw)&&!(ex>minx+hw&&ex<maxx-hw&&ey>miny+hw&&ey<maxy-hw);  // near the outline ring
+  }
+  const p=it.pts; for(let i=0;i<p.length;i++){ const w=(p[i].w||it.base)/2+R;   // stroke: near any segment
+    if(i+1<p.length){ if(segDist(ex,ey,p[i].x,p[i].y,p[i+1].x,p[i+1].y)<=w) return true; }
+    else { const dx=ex-p[i].x,dy=ey-p[i].y; if(dx*dx+dy*dy<=w*w) return true; } }
+  return false;
+}
+/* The eraser erases everything under the brush, not just the current frame. After a
+   deep zoom the app rebases so content lives in an ancestor, and the LOD fill keeps it
+   visible from far above the render window — so we climb the whole chain to the top,
+   then DFS back down through EVERY frame the brush overlaps (ancestors, current,
+   descendants and siblings), with the brush converted into each frame's coordinates. */
+const ERASE_UP_CAP=48;                                                     // reach as far up as the LOD fill can show content
+function eraseNodes(pt){
+  let ex=wX(pt.x),ey=wY(pt.y),R=eraseWorldW()/2,w=eraseWorldW(),node=current,scale=camScale;
+  for(let i=0;i<ERASE_UP_CAP && node.up;i++){ const up=node.up; ex=up.x+ex*up.k; ey=up.y+ey*up.k; R*=up.k; w*=up.k; scale/=up.k; node=up.parent; }
+  const out=[], stack=[{node,ex,ey,R,w,scale}];
+  while(stack.length){ const d=stack.pop(); out.push(d);
+    for(const c of d.node.children){ const cs=d.scale*c.k; if(cs<0.18) continue;   // matches the render cull, so anything visible is reachable
+      const b=bboxOf(c.node); if(!b) continue;                            // empty frame: nothing to erase (also skips work)
+      const bx0=c.x+b.x0*c.k,by0=c.y+b.y0*c.k,bx1=c.x+b.x1*c.k,by1=c.y+b.y1*c.k;   // child CONTENT box (not the unit box) in this frame's coords
+      const qx=Math.max(bx0-d.ex,d.ex-bx1,0), qy=Math.max(by0-d.ey,d.ey-by1,0);    // brush disk vs content box
+      if(qx*qx+qy*qy<=d.R*d.R) stack.push({node:c.node,ex:(d.ex-c.x)/c.k,ey:(d.ey-c.y)/c.k,R:d.R/c.k,w:d.w/c.k,scale:cs}); }
+  }
+  return out;
+}
+function ensureSnap(node){ if(eraseSnap&&!eraseSnap.has(node)) eraseSnap.set(node,node.items.map(cloneItem)); }   // clean pre-drag copy, once per node
+function insideDisk(p,cx,cy,R){ const rr=R+(p.w||0)/2, dx=p.x-cx,dy=p.y-cy; return dx*dx+dy*dy<=rr*rr; }
+function circleSeg(ax,ay,bx,by,cx,cy,rr){                                  // where segment A->B crosses the circle: [t0,t1] clamped to [0,1], or null
+  const dx=bx-ax,dy=by-ay,fx=ax-cx,fy=ay-cy,a=dx*dx+dy*dy; if(a<1e-12) return null;
+  const b=2*(fx*dx+fy*dy),c=fx*fx+fy*fy-rr*rr; let disc=b*b-4*a*c; if(disc<0) return null; disc=Math.sqrt(disc);
+  const t0=(-b-disc)/(2*a),t1=(-b+disc)/(2*a); if(t1<0||t0>1) return null; return [t0<0?0:t0,t1>1?1:t1];
+}
+/* Cut the part of a stroke that falls inside the eraser disk, inserting points exactly on
+   the disk boundary plus a break marker in the gap. Only the ink under the brush is removed
+   — not the whole segment between sparse sample points — so it behaves like a real eraser. */
+function clipStrokeDisk(pts,cx,cy,R){
+  const out=[]; let changed=false;
+  const lerp=(a,b,t)=>({x:a.x+(b.x-a.x)*t,y:a.y+(b.y-a.y)*t,w:(a.w||0)+((b.w||0)-(a.w||0))*t});
+  const brk=()=>{ if(out.length&&!out[out.length-1].e) out.push({e:true}); };   // gap marker (skipped when drawing)
+  for(let i=0;i<pts.length;i++){
+    const A=pts[i];
+    if(A.e){ brk(); continue; }
+    const aIn=insideDisk(A,cx,cy,R);
+    if(aIn){ brk(); changed=true; } else out.push(A);
+    const B=i+1<pts.length?pts[i+1]:null; if(!B||B.e) continue;
+    const rr=R+((A.w||0)+(B.w||0))/4, seg=circleSeg(A.x,A.y,B.x,B.y,cx,cy,rr); if(!seg) continue;
+    const bIn=insideDisk(B,cx,cy,R),t0=seg[0],t1=seg[1];
+    if(!aIn&&!bIn){ if(t0>0&&t1<1){ out.push(lerp(A,B,t0)); brk(); out.push(lerp(A,B,t1)); changed=true; } }   // bite out the middle
+    else if(!aIn&&bIn){ out.push(lerp(A,B,t0)); brk(); changed=true; }                                        // cut at entry
+    else if(aIn&&!bIn){ brk(); out.push(lerp(A,B,t1)); changed=true; }                                        // cut at exit
+  }
+  return changed?out:null;
+}
+/* One brush position on a stroke. If the eraser disk is at least as wide as the line is
+   thick (R >= half-width) it severs the line — clip the centre geometry out (splitting the
+   stroke, so fully-erased pieces vanish). If it's smaller (a small eraser on a thick line)
+   it can't cut through, so we punch a masked hole in the body instead. Holes are bounded:
+   consecutive stamps closer than R/2 are skipped. */
+function eraseAt(node,ex,ey,R){
+  let touched=false;
+  for(const it of node.items){
+    if(it.dead) continue;
+    const L=layerOf(it); if(L&&(!L.visible||L.locked)) continue;       // don't erase hidden or locked layers
+    if(it.kind==="stroke"){
+      const b=itemBounds(it);
+      if(ex<b.x0-R||ex>b.x1+R||ey<b.y0-R||ey>b.y1+R) continue;             // broad phase
+      const hw=(it.base||0)/2*(it.mode==="marker"?2.2:1);                  // visual half-width (markers render wider)
+      if(R>=hw){                                                           // cut clean through
+        const np=clipStrokeDisk(it.pts,ex,ey,R);
+        if(np){ ensureSnap(node); it.pts=np; it.bb=undefined; touched=true; }
+      } else {                                                             // punch a hole in the body
+        if(!it.holes) it.holes=[]; const last=it.holes[it.holes.length-1];
+        if(!last||Math.hypot(ex-last.x,ey-last.y)>R*0.5){ ensureSnap(node); it.holes.push({x:ex,y:ey,r:R}); touched=true; }
+      }
+    } else if(eraserTouches(it,ex,ey,R)){ ensureSnap(node); it.dead=true; touched=true; }
+  }
+  if(touched) markDirty(node);
+}
+function eraseSample(pt){
+  for(const t of eraseNodes(pt)){
+    const last=eraseLast&&eraseLast.get(t.node);                            // interpolate along the drag so fast strokes don't skip past thin lines
+    if(last){ const dx=t.ex-last.ex,dy=t.ey-last.ey,dist=Math.hypot(dx,dy);
+      const n=Math.min(64,Math.max(1,Math.ceil(dist/Math.max(t.R,1e-6))));
+      for(let i=1;i<=n;i++){ const f=i/n; eraseAt(t.node,last.ex+dx*f,last.ey+dy*f,t.R); } }
+    else eraseAt(t.node,t.ex,t.ey,t.R);
+    if(eraseLast) eraseLast.set(t.node,{ex:t.ex,ey:t.ey});
+  }
+  dirty=true;
+}
+/* Turn a stroke whose points carry `e` flags into the surviving runs (independent strokes);
+   lone leftover points from a split are dropped so erasing doesn't leave stray dots. */
+function splitStroke(it){
+  const runs=[]; let cur=null;
+  for(const p of it.pts){ if(p.e){ cur=null; } else { if(!cur){ cur=[]; runs.push(cur); } cur.push({x:p.x,y:p.y,w:p.w}); } }
+  const hw=(it.base||0)/2, minLen=(it.base||0)*0.6;                         // drop sub-visible stubs erasing scatters (a piece shorter than the line is thick is just a dot the brush sat on) — curbs fragment/item growth
+  return runs.filter(r=>{
+    if(r.length<2) return false;
+    let x0=1/0,y0=1/0,x1=-1/0,y1=-1/0;
+    for(const p of r){ if(p.x<x0)x0=p.x; if(p.x>x1)x1=p.x; if(p.y<y0)y0=p.y; if(p.y>y1)y1=p.y; }
+    return Math.hypot(x1-x0,y1-y0)>=minLen;
+  }).map(r=>{
+    const s={kind:"stroke",lyr:it.lyr,mode:it.mode,color:it.color,alpha:it.alpha,base:it.base,pts:r,bb:undefined};
+    if(it.holes&&it.holes.length){ const bb=strokeBB(s);                    // keep only the holes that touch this piece — don't copy every hole onto every split
+      const hs=it.holes.filter(h=>h.x+h.r>=bb.x0-hw&&h.x-h.r<=bb.x1+hw&&h.y+h.r>=bb.y0-hw&&h.y-h.r<=bb.y1+hw);
+      if(hs.length) s.holes=hs.map(h=>({x:h.x,y:h.y,r:h.r})); }
+    return s;
+  });
+}
+function commitErase(){
+  if(eraseSnap&&eraseSnap.size){
+    const itemChanges=[];
+    for(const [node,before] of eraseSnap){
+      const after=[];
+      for(const it of node.items){
+        if(it.dead) continue;
+        if(it.kind==="stroke"&&it.pts.some(p=>p.e)){ for(const s of splitStroke(it)) after.push(s); }
+        else after.push(it);
+      }
+      node.items=after; markDirty(node);
+      itemChanges.push({node,before,after:null});   // filled in below, once cascade-cleanup has settled every touched frame's flownode ids
+    }
+    for(const [node] of eraseSnap){                 // drop any connector a just-erased flownode left dangling
+      const kept=node.items.filter(it=>it.kind!=="connector"||(findFlowNode(it.fromId)&&findFlowNode(it.toId)));
+      if(kept.length!==node.items.length){ node.items=kept; markDirty(node); }
+    }
+    for(const ic of itemChanges) ic.after=ic.node.items.map(cloneItem);
+    const removed=detachEmptyFrames();
+    pushHist({type:"verase",itemChanges,removed});
+  }
+  eraseSnap=eraseLast=null;
+}
+function hitItem(it,px,py,R){
+  if(it.kind==="stroke"){ for(const q of it.pts){ const dx=sxNow(q.x)-px,dy=syNow(q.y)-py; if(dx*dx+dy*dy<=R*R) return true; } return false; }
+  if(it.kind==="raster"){ const x=sxNow(it.x),y=syNow(it.y),w=(it.src.width||1)*it.s*camScale,h=(it.src.height||1)*it.s*camScale; return px>=x-R&&px<=x+w+R&&py>=y-R&&py<=y+h+R; }
+  if(it.kind==="text"){ const m=textMetrics(it),x=sxNow(it.x),y=syNow(it.y),w=m.w*camScale,h=m.h*camScale; return px>=x-R&&px<=x+w+R&&py>=y-R&&py<=y+h+R; }
+  if(it.kind==="flownode"){ const x0=sxNow(it.x0),y0=syNow(it.y0),x1=sxNow(it.x1),y1=syNow(it.y1);   // clickable anywhere inside — it's a filled node, not a hollow creative shape
+    return px>=Math.min(x0,x1)-R&&px<=Math.max(x0,x1)+R&&py>=Math.min(y0,y1)-R&&py<=Math.max(y0,y1)+R; }
+  if(it.kind==="connector"){ const r=connectorRoute(it); if(!r) return false;
+    for(let i=0;i+1<r.points.length;i++){ const a=r.points[i],b=r.points[i+1]; if(segDist(px,py,sxNow(a.x),syNow(a.y),sxNow(b.x),syNow(b.y))<=R) return true; } return false; }
+  const x0=sxNow(it.x0),y0=syNow(it.y0),x1=sxNow(it.x1),y1=syNow(it.y1);
+  if(it.shape==="line") return segDist(px,py,x0,y0,x1,y1)<=R;
+  const minx=Math.min(x0,x1),maxx=Math.max(x0,x1),miny=Math.min(y0,y1),maxy=Math.max(y0,y1);
+  return (px>=minx-R&&px<=maxx+R&&py>=miny-R&&py<=maxy+R)&&!(px>minx+R&&px<maxx-R&&py>miny+R&&py<maxy-R);
+}
+function segDist(px,py,x0,y0,x1,y1){ const dx=x1-x0,dy=y1-y0,l2=dx*dx+dy*dy; let t=l2?((px-x0)*dx+(py-y0)*dy)/l2:0; t=Math.max(0,Math.min(1,t)); return Math.hypot(px-(x0+dx*t),py-(y0+dy*t)); }
+function pickItem(px,py){ const R=Math.max(10,(6)); for(let i=current.items.length-1;i>=0;i--){ const it=current.items[i]; const L=layerOf(it); if(L&&(!L.visible||L.locked)) continue; if(hitItem(it,px,py,R)) return it; } return null; }
+function pickFlowNode(px,py){ const R=6; for(let i=current.items.length-1;i>=0;i--){ const it=current.items[i]; if(it.kind!=="flownode") continue; const L=layerOf(it); if(L&&(!L.visible||L.locked)) continue; if(hitItem(it,px,py,R)) return it; } return null; }
+
+/* ---------------- select / move / resize ---------------- */
+function cloneErases(er){ return er?er.map(e=>({base:e.base,pts:e.pts.map(p=>({x:p.x,y:p.y,w:p.w}))})):undefined; }
+function cloneHoles(h){ return h&&h.length?h.map(o=>({x:o.x,y:o.y,r:o.r})):undefined; }   // erase holes: world-space circle stamps
+function cloneClips(cl){ return cl&&cl.length?cl.map(c=>({poly:c.poly.map(p=>({x:p.x,y:p.y}))})):undefined; }   // region-cut holes: world-space filled polygons
+function cloneKeep(k){ return k&&k.length?k.map(p=>({x:p.x,y:p.y})):undefined; }   // region-cut lifted piece: world-space polygon the item is clipped INTO (keep only inside)
+function cloneItem(it){                                                     // deep copy of an item's geometry (image src shared); no transient erase flags
+  if(it.kind==="raster") return {kind:"raster",lyr:it.lyr,x:it.x,y:it.y,s:it.s,alpha:it.alpha,src:it.src,erases:cloneErases(it.erases),clips:cloneClips(it.clips),keep:cloneKeep(it.keep)};
+  if(it.kind==="shape") return {kind:"shape",lyr:it.lyr,shape:it.shape,color:it.color,alpha:it.alpha,base:it.base,x0:it.x0,y0:it.y0,x1:it.x1,y1:it.y1,erases:cloneErases(it.erases),clips:cloneClips(it.clips),keep:cloneKeep(it.keep)};
+  if(it.kind==="text") return {kind:"text",lyr:it.lyr,x:it.x,y:it.y,size:it.size,text:it.text,color:it.color,alpha:it.alpha,clips:cloneClips(it.clips),keep:cloneKeep(it.keep)};
+  if(it.kind==="flownode") return {kind:"flownode",lyr:it.lyr,fid:it.fid,shape:it.shape,color:it.color,fill:it.fill,alpha:it.alpha,base:it.base,x0:it.x0,y0:it.y0,x1:it.x1,y1:it.y1,text:it.text};
+  if(it.kind==="connector") return {kind:"connector",lyr:it.lyr,fid:it.fid,fromId:it.fromId,toId:it.toId,bend:it.bend,color:it.color,base:it.base};
+  return {kind:"stroke",lyr:it.lyr,mode:it.mode,color:it.color,alpha:it.alpha,base:it.base,pts:it.pts.map(p=>({x:p.x,y:p.y,w:p.w})),erases:cloneErases(it.erases),holes:cloneHoles(it.holes),clips:cloneClips(it.clips),keep:cloneKeep(it.keep),bb:undefined};
+}
+function geomOf(it){
+  if(it.kind==="flownode") return {x0:it.x0,y0:it.y0,x1:it.x1,y1:it.y1,base:it.base};
+  if(it.kind==="connector") return {bend:it.bend};
+  const er=cloneErases(it.erases), cl=cloneClips(it.clips), kp=cloneKeep(it.keep);
+  if(it.kind==="raster")return{x:it.x,y:it.y,s:it.s,erases:er,clips:cl,keep:kp};
+  if(it.kind==="shape")return{x0:it.x0,y0:it.y0,x1:it.x1,y1:it.y1,base:it.base,erases:er,clips:cl,keep:kp};
+  if(it.kind==="text")return{x:it.x,y:it.y,size:it.size,clips:cl,keep:kp};
+  return{base:it.base,pts:it.pts.map(p=>({x:p.x,y:p.y,w:p.w})),erases:er,holes:cloneHoles(it.holes),clips:cl,keep:kp}; }
+function setGeom(it,g){ if(it.kind==="flownode"){ it.x0=g.x0;it.y0=g.y0;it.x1=g.x1;it.y1=g.y1;it.base=g.base; return; } if(it.kind==="connector"){ it.bend=g.bend; return; }
+  if(it.kind==="raster"){it.x=g.x;it.y=g.y;it.s=g.s;} else if(it.kind==="shape"){it.x0=g.x0;it.y0=g.y0;it.x1=g.x1;it.y1=g.y1;it.base=g.base;} else if(it.kind==="text"){it.x=g.x;it.y=g.y;it.size=g.size;it._w=null;} else {it.base=g.base; it.pts=g.pts.map(p=>({x:p.x,y:p.y,w:p.w})); it.holes=cloneHoles(g.holes); it.bb=undefined;}
+  it.erases=cloneErases(g.erases); it.clips=cloneClips(g.clips); it.keep=cloneKeep(g.keep); }
+function translateItem(it,dx,dy){ if(it.kind==="raster"||it.kind==="text"){it.x+=dx;it.y+=dy;} else if(it.kind==="shape"||it.kind==="flownode"){it.x0+=dx;it.y0+=dy;it.x1+=dx;it.y1+=dy;} else if(it.kind==="connector"){ /* derived from its endpoint nodes — nothing to translate */ } else { for(const p of it.pts){p.x+=dx;p.y+=dy;} if(it.holes) for(const h of it.holes){ h.x+=dx; h.y+=dy; } it.bb=undefined; }
+  if(it.erases) for(const e of it.erases) for(const p of e.pts){ p.x+=dx; p.y+=dy; }
+  if(it.clips) for(const c of it.clips) for(const p of c.poly){ p.x+=dx; p.y+=dy; }
+  if(it.keep) for(const p of it.keep){ p.x+=dx; p.y+=dy; } }
+function scaleFromSnap(it,snap,pvx,pvy,f){
+  if(it.kind==="raster"){ it.x=pvx+(snap.x-pvx)*f; it.y=pvy+(snap.y-pvy)*f; it.s=snap.s*f; }
+  else if(it.kind==="text"){ it.x=pvx+(snap.x-pvx)*f; it.y=pvy+(snap.y-pvy)*f; it.size=snap.size*f; it._w=null; }
+  else if(it.kind==="shape"||it.kind==="flownode"){ it.x0=pvx+(snap.x0-pvx)*f; it.y0=pvy+(snap.y0-pvy)*f; it.x1=pvx+(snap.x1-pvx)*f; it.y1=pvy+(snap.y1-pvy)*f; it.base=snap.base*f; }
+  else if(it.kind==="connector"){ /* derived — nothing to scale */ }
+  else { it.base=snap.base*f; it.pts=snap.pts.map(p=>({x:pvx+(p.x-pvx)*f,y:pvy+(p.y-pvy)*f,w:p.w*f})); it.bb=undefined;
+    it.holes=snap.holes?snap.holes.map(h=>({x:pvx+(h.x-pvx)*f,y:pvy+(h.y-pvy)*f,r:h.r*f})):undefined; }
+  it.erases=snap.erases?snap.erases.map(e=>({base:e.base*f,pts:e.pts.map(p=>({x:pvx+(p.x-pvx)*f,y:pvy+(p.y-pvy)*f,w:p.w*f}))})):undefined;
+  it.clips=snap.clips?snap.clips.map(c=>({poly:c.poly.map(p=>({x:pvx+(p.x-pvx)*f,y:pvy+(p.y-pvy)*f}))})):undefined;
+  it.keep=snap.keep?snap.keep.map(p=>({x:pvx+(p.x-pvx)*f,y:pvy+(p.y-pvy)*f})):undefined;
+}
+function selectPointerDown(p){
+  if(groupSel){ if(groupPointerDown(p)) return; }   // a floating region selection is active: handle its move/resize/drop first
+  if(selected&&selected.kind==="connector"&&current.items.indexOf(selected)>=0){
+    const route=connectorRoute(selected);
+    if(route&&route.points.length===4){                                     // only a bent (not dead-straight) connector has a draggable middle segment
+      const m0=route.points[1], m1=route.points[2];
+      if(segDist(p.x,p.y,sxNow(m0.x),syNow(m0.y),sxNow(m1.x),syNow(m1.y))<=10){
+        bendInfo={axis:Math.abs(m0.x-m1.x)<0.5?"x":"y", p1:route.points[0], p2:route.points[3]};
+        transformSnap=geomOf(selected); mode="bendConnector"; dirty=true; return;
+      }
+    }
+  } else if(selected&&current.items.indexOf(selected)>=0){
+    const b=itemBounds(selected); const wc=[[b.x0,b.y0],[b.x1,b.y0],[b.x1,b.y1],[b.x0,b.y1]];
+    for(let i=0;i<4;i++){ if(Math.hypot(sxNow(wc[i][0])-p.x,syNow(wc[i][1])-p.y)<=12){
+      const pv=wc[(i+2)%4], drag=wc[i]; resizeInfo={pvx:pv[0],pvy:pv[1],len:Math.max(1e-6,Math.hypot(drag[0]-pv[0],drag[1]-pv[1]))};
+      transformSnap=geomOf(selected); mode="resize"; return; } }
+  }
+  const it=pickItem(p.x,p.y);
+  if(it){ selected=it; transformSnap=it.kind==="connector"?null:geomOf(it); dragLast={x:p.x,y:p.y}; mode=it.kind==="connector"?null:"move"; }   // a connector only moves via its bend handle, not a free drag
+  else { selected=null; mode=null; }
+  dirty=true;
+}
+function dragBend(p){ if(!bendInfo||!selected) return; const wx=wX(p.x),wy=wY(p.y);
+  const f=bendInfo.axis==="x"?(wx-bendInfo.p1.x)/(bendInfo.p2.x-bendInfo.p1.x):(wy-bendInfo.p1.y)/(bendInfo.p2.y-bendInfo.p1.y);
+  selected.bend=Math.max(0.05,Math.min(0.95,f)); markDirty(current); dirty=true; }
+function polyBBox(poly){ let x0=1/0,y0=1/0,x1=-1/0,y1=-1/0; for(const q of poly){ if(q.x<x0)x0=q.x; if(q.x>x1)x1=q.x; if(q.y<y0)y0=q.y; if(q.y>y1)y1=q.y; } return {x0,y0,x1,y1}; }
+function groupStartTransform(){ groupBefore=current.items.map(cloneItem); groupGeomBefore=groupSel.items.map(geomOf); }
+/* Floating (region-cut) selection: a group of vector copies clipped into the cut polygon.
+   Grab a corner of its bounding box to scale, grab inside to move, click outside to drop it. */
+function groupPointerDown(p){
+  const bb=polyBBox(groupSel.poly), wc=[[bb.x0,bb.y0],[bb.x1,bb.y0],[bb.x1,bb.y1],[bb.x0,bb.y1]];
+  for(let i=0;i<4;i++){ if(Math.hypot(sxNow(wc[i][0])-p.x,syNow(wc[i][1])-p.y)<=12){
+    const pv=wc[(i+2)%4]; resizeInfo={pvx:pv[0],pvy:pv[1],len:Math.max(1e-6,Math.hypot(wc[i][0]-pv[0],wc[i][1]-pv[1]))};
+    groupSnap=groupSel.items.map(geomOf); groupPolySnap=groupSel.poly.map(q=>({x:q.x,y:q.y})); groupStartTransform(); mode="resize"; dirty=true; return true; } }
+  const wx=wX(p.x),wy=wY(p.y);
+  if(wx>=bb.x0&&wx<=bb.x1&&wy>=bb.y0&&wy<=bb.y1){ dragLast={x:p.x,y:p.y}; groupStartTransform(); mode="move"; dirty=true; return true; }
+  groupSel=null;   // clicked away — commit/drop the floating selection (its pieces already live in items)
+  return false;
+}
+function moveSel(p){ const dx=(p.x-dragLast.x)/camScale, dy=(p.y-dragLast.y)/camScale;
+  if(groupSel){ for(const it of groupSel.items) translateItem(it,dx,dy); for(const q of groupSel.poly){ q.x+=dx; q.y+=dy; } dragLast={x:p.x,y:p.y}; markDirty(current); dirty=true; return; }
+  if(!selected) return; translateItem(selected,dx,dy); dragLast={x:p.x,y:p.y}; markDirty(current); dirty=true; }
+function resizeSel(p){ if(!resizeInfo) return; const f=Math.max(0.05,Math.hypot(wX(p.x)-resizeInfo.pvx,wY(p.y)-resizeInfo.pvy)/resizeInfo.len);
+  if(groupSel){ for(let i=0;i<groupSel.items.length;i++) scaleFromSnap(groupSel.items[i],groupSnap[i],resizeInfo.pvx,resizeInfo.pvy,f);
+    groupSel.poly=groupPolySnap.map(q=>({x:resizeInfo.pvx+(q.x-resizeInfo.pvx)*f,y:resizeInfo.pvy+(q.y-resizeInfo.pvy)*f})); markDirty(current); dirty=true; return; }
+  if(!selected||!transformSnap) return; scaleFromSnap(selected,transformSnap,resizeInfo.pvx,resizeInfo.pvy,f); markDirty(current); dirty=true; }
+function endTransform(){
+  if(groupSel){ if(groupGeomBefore){ const after=groupSel.items.map(geomOf); if(JSON.stringify(after)!==JSON.stringify(groupGeomBefore)) pushHist({type:"items",node:current,before:groupBefore,after:current.items.map(cloneItem)}); }
+    groupBefore=groupGeomBefore=groupSnap=groupPolySnap=null; resizeInfo=null; dragLast=null; return; }
+  if(selected&&transformSnap){ const after=geomOf(selected); const changed=JSON.stringify(after)!==JSON.stringify(transformSnap); if(changed) pushHist({type:"transform",node:current,item:selected,before:transformSnap,after}); } transformSnap=null; resizeInfo=null; dragLast=null; bendInfo=null; }
+function deleteSelected(){
+  if(groupSel){ const before=current.items.map(cloneItem); current.items=current.items.filter(it=>groupSel.items.indexOf(it)<0);   // drop the lifted pieces; the hole stays
+    markDirty(current); pushHist({type:"items",node:current,before,after:current.items.map(cloneItem)}); groupSel=null; dirty=true; return; }
+  if(!selected) return;
+  if(selected.kind==="flownode"){                                           // cascade: drop the node's own connectors too, atomically, so undo restores both together
+    const before=current.items.map(cloneItem), fid=selected.fid;
+    current.items=current.items.filter(it=>it!==selected&&!(it.kind==="connector"&&(it.fromId===fid||it.toId===fid)));
+    markDirty(current); pushHist({type:"items",node:current,before,after:current.items.map(cloneItem)}); selected=null; dirty=true; return;
+  }
+  const i=current.items.indexOf(selected); if(i>=0){ current.items.splice(i,1); pushHist({type:"erase",node:current,removed:[{item:selected,i}]}); markDirty(current); } selected=null; dirty=true; }
+
+/* ---------------- region cut (Photoshop-style lift) ----------------
+   Draw a rectangle / ellipse / lasso; the content inside is lifted into a floating VECTOR
+   selection (the actual strokes/shapes/images, each clipped INTO the region via a `keep`
+   polygon — so it stays full resolution at any zoom) and a matching hole is punched into the
+   items underneath (a `clip` polygon per item). It reads like cutting a piece out and moving
+   it, and because the piece is vector it never blurs the way a pixel snapshot would. */
+function regionStart(p){ regionDraft = regionShape==="lasso" ? {shape:"lasso",pts:[{x:p.x,y:p.y}]} : {shape:regionShape,x0:p.x,y0:p.y,x1:p.x,y1:p.y}; dirty=true; }
+function regionExtend(p){ if(!regionDraft) return;
+  if(regionDraft.shape==="lasso"){ const l=regionDraft.pts[regionDraft.pts.length-1]; if(Math.hypot(p.x-l.x,p.y-l.y)>=2) regionDraft.pts.push({x:p.x,y:p.y}); }
+  else { regionDraft.x1=p.x; regionDraft.y1=p.y; } dirty=true; }
+function regionPolyScreen(rd){                                             // the marquee as a screen-space polygon (ellipse/rect flattened to points)
+  if(rd.shape==="lasso") return rd.pts.slice();
+  const x0=Math.min(rd.x0,rd.x1),x1=Math.max(rd.x0,rd.x1),y0=Math.min(rd.y0,rd.y1),y1=Math.max(rd.y0,rd.y1);
+  if(rd.shape==="ellipse"){ const cx=(x0+x1)/2,cy=(y0+y1)/2,rx=(x1-x0)/2,ry=(y1-y0)/2,N=56,out=[];
+    for(let i=0;i<N;i++){ const a=i/N*6.2832; out.push({x:cx+rx*Math.cos(a),y:cy+ry*Math.sin(a)}); } return out; }
+  return [{x:x0,y:y0},{x:x1,y:y0},{x:x1,y:y1},{x:x0,y:y1}];
+}
+function regionCommit(){
+  const rd=regionDraft; regionDraft=null; if(!rd){ dirty=true; return; }
+  const poly=regionPolyScreen(rd); if(poly.length<3){ dirty=true; return; }
+  const bb=polyBBox(poly);
+  if(bb.x1-bb.x0<4||bb.y1-bb.y0<4){ dirty=true; hintFlash("Selection too small"); return; }
+  performCut(poly);
+}
+function performCut(polyScreen){
+  const wpoly=polyScreen.map(q=>({x:wX(q.x),y:wY(q.y)}));                   // the marquee in world units, anchored to the scene
+  const bb=polyBBox(wpoly);
+  const before=current.items.map(cloneItem);
+  const lifted=[];
+  for(const it of current.items.slice()){                                  // slice: we append copies as we go
+    if(it.kind==="flownode"||it.kind==="connector") continue;   // structural, not liftable content — a lifted copy would duplicate its fid and confuse connector binding
+    const L=layerOf(it); if(L&&(!L.visible||L.locked)) continue;   // don't cut from hidden/locked layers
+    const b=itemBounds(it);
+    if(b.x1<bb.x0||b.x0>bb.x1||b.y1<bb.y0||b.y0>bb.y1) continue;           // item can't overlap the region
+    const copy=cloneItem(it); copy.keep=wpoly.map(q=>({x:q.x,y:q.y}));      // lifted piece: keep only what's inside the region
+    lifted.push(copy);
+    (it.clips||(it.clips=[])).push({poly:wpoly.map(q=>({x:q.x,y:q.y}))});   // hole: remove what's inside the region from the original
+    if(it.kind==="stroke") it.bb=undefined;
+  }
+  if(!lifted.length){ dirty=true; hintFlash("Nothing to cut here"); return; }
+  for(const c of lifted) addItemTo(current,c,curLayer().id);              // floating pieces sit on top of the hole, on the active layer
+  const after=current.items.map(cloneItem);
+  markDirty(current); pushHist({type:"items",node:current,before,after});
+  setTool("select"); selected=null; groupSel={items:lifted,poly:wpoly.map(q=>({x:q.x,y:q.y}))}; dirty=true;
+  hintFlash("Cut out — drag to move · corners to resize · Delete to remove");
+}
+
+/* ---------------- text tool ----------------
+   Text is a first-class vector item ({x,y in world, size in world units, string}). While
+   typing it's a transparent <textarea> overlaid exactly on the item (which is hidden during
+   the edit); on commit the string bakes into the item and it renders/moves/scales like anything
+   else. Clicking the tool on empty space starts a new label; clicking existing text re-edits it. */
+const textEdit=document.getElementById("textEdit");
+function sizeTextEdit(){ const it=editingText; if(!it) return;
+  if(it.kind==="flownode"){                                                 // wrap-and-centre inside the node's own box, instead of the free-growing left-aligned text tool
+    const b=normBox(it), x0=sxNow(b.x0),y0=syNow(b.y0),x1=sxNow(b.x1),y1=syNow(b.y1);
+    const px=Math.max(1,(y1-y0)*0.28);   // matches the baked render's uncapped scale — no size jump between editing and committed
+    textEdit.style.left=(x0+6)+"px"; textEdit.style.top=(y0+6)+"px";
+    textEdit.style.width=Math.max(10,x1-x0-12)+"px"; textEdit.style.height=Math.max(10,y1-y0-12)+"px";
+    textEdit.style.fontSize=px+"px"; textEdit.style.color=it.color; textEdit.style.textAlign="center"; textEdit.style.whiteSpace="pre-wrap";
+    return;
+  }
+  textEdit.style.textAlign="left"; textEdit.style.whiteSpace="pre";
+  const px=Math.max(2,it.size*camScale);
+  textEdit.style.left=sxNow(it.x)+"px"; textEdit.style.top=syNow(it.y)+"px"; textEdit.style.fontSize=px+"px"; textEdit.style.color=it.color;
+  ctx.save(); ctx.font=textFontStr(px); let w=0; for(const ln of (textEdit.value||"").split("\n")) w=Math.max(w,ctx.measureText(ln||" ").width); ctx.restore();
+  const lines=(textEdit.value||"").split("\n").length;
+  textEdit.style.width=(w+px*0.6+4)+"px"; textEdit.style.height=(lines*px*TEXT_LH+4)+"px"; }
+function beginEditText(it,isNew,before){
+  finishTextEdit();                                                        // commit any edit already in progress
+  editingText=it; textNew=isNew; textBefore=before||current.items.map(cloneItem);
+  textEdit.value=it.text||""; textEdit.hidden=false; sizeTextEdit();
+  setTimeout(()=>{ textEdit.focus(); const n=textEdit.value.length; try{ textEdit.setSelectionRange(n,n); }catch(e){} },0);
+  dirty=true; }
+function finishTextEdit(){
+  if(!editingText) return; const it=editingText; editingText=null; textEdit.hidden=true;
+  it.text=textEdit.value; it._w=null;
+  if(it.kind==="text"&&!it.text.trim()){ const idx=current.items.indexOf(it); if(idx>=0) current.items.splice(idx,1); }   // empty label → drop it (a flownode keeps its box even unlabelled)
+  markDirty(current); const after=current.items.map(cloneItem);
+  if(JSON.stringify(after)!==JSON.stringify(textBefore||[])) pushHist({type:"items",node:current,before:textBefore||[],after});
+  textBefore=null; selected=current.items.indexOf(it)>=0?it:null; dirty=true; scheduleSave(); }
+function textToolTap(p){
+  for(let i=current.items.length-1;i>=0;i--){ const it=current.items[i]; const L=layerOf(it); if(L&&(!L.visible||L.locked)) continue; if(it.kind==="text"&&hitItem(it,p.x,p.y,6)){ beginEditText(it,false); return; } }
+  const before=current.items.map(cloneItem);
+  const it={kind:"text",x:wX(p.x),y:wY(p.y),size:textSize/camScale,text:"",color,alpha:1};
+  addItemTo(current,it); markDirty(current); beginEditText(it,true,before); }
+textEdit.addEventListener("input",()=>{ if(editingText){ editingText.text=textEdit.value; editingText._w=null; sizeTextEdit(); dirty=true; } });
+textEdit.addEventListener("blur",finishTextEdit);
+textEdit.addEventListener("keydown",e=>{ e.stopPropagation(); if(e.key==="Escape"||(e.key==="Enter"&&(e.metaKey||e.ctrlKey))){ e.preventDefault(); textEdit.blur(); } });
+
+/* ---------------- eyedropper ---------------- */
+function sampleColorAt(p){                                                  // read the composited pixel under the cursor and adopt it as the ink colour
+  const x=Math.max(0,Math.min(canvas.width-1,Math.round(p.x*dpr))), y=Math.max(0,Math.min(canvas.height-1,Math.round(p.y*dpr)));
+  try{ const d=ctx.getImageData(x,y,1,1).data; if(d[3]>8){ const hex="#"+hex2(d[0])+hex2(d[1])+hex2(d[2]); setInk(hex); pushRecent(hex); hintFlash("Picked "+hex.toUpperCase()); return true; } }catch(e){}
+  if(bgColor){ setInk(bgColor); pushRecent(bgColor); hintFlash("Picked "+bgColor.toUpperCase()); return true; }
+  hintFlash("Nothing to pick here"); return false;
+}
+
+/* ---------------- duplicate / copy-paste ---------------- */
+let clipboard=null;
+function selItems(){ if(groupSel) return groupSel.items; if(selected&&current.items.indexOf(selected)>=0) return [selected]; return null; }
+function unionPoly(items){ let x0=1/0,y0=1/0,x1=-1/0,y1=-1/0; for(const it of items){ const b=itemBounds(it); if(b.x0<x0)x0=b.x0; if(b.y0<y0)y0=b.y0; if(b.x1>x1)x1=b.x1; if(b.y1>y1)y1=b.y1; } return [{x:x0,y:y0},{x:x1,y:y0},{x:x1,y:y1},{x:x0,y:y1}]; }
+function placeCopies(src,off){
+  const before=current.items.map(cloneItem);
+  const copies=src.map(it=>{ const c=cloneItem(it); translateItem(c,off,off); return c; });
+  for(const c of copies) addItemTo(current,c,layerIndex(c.lyr)>=0?c.lyr:curLayer().id);
+  markDirty(current); pushHist({type:"items",node:current,before,after:current.items.map(cloneItem)});
+  setTool("select");
+  if(copies.length>1){ selected=null; groupSel={items:copies,poly:unionPoly(copies)}; } else { groupSel=null; selected=copies[0]; }
+  dirty=true;
+}
+function copySelection(){ const s=selItems(); if(!s||!s.length) return; clipboard=s.map(cloneItem); hintFlash(s.length===1?"Copied":s.length+" copied"); }
+function pasteClipboard(){ if(!clipboard||!clipboard.length) return; placeCopies(clipboard,26/camScale); hintFlash("Pasted"); }
+function duplicateSelection(){ const s=selItems(); if(!s||!s.length) return; placeCopies(s,26/camScale); }
+
+/* ---------------- image placement ---------------- */
+function placeImage(rect){
+  if(!pendingImage) return; const img=pendingImage, ar=img.width/img.height;
+  let bw=rect.w, bh=rect.h, cx,cy;
+  if(bw<8&&bh<8){ bw=VIEW*0.5; bh=bw/ar; cx=W/2; cy=H/2; } else { cx=rect.x+rect.w/2; cy=rect.y+rect.h/2; }
+  let dw=bw, dh=dw/ar; if(dh>bh&&bh>8){ dh=bh; dw=dh*ar; }
+  const it={kind:"raster",src:img,x:wX(cx-dw/2),y:wY(cy-dh/2),s:(dw/img.width)/camScale,alpha:1};
+  addItemTo(current,it); markDirty(current); pushHist({type:"add",node:current,item:it}); dirty=true;
+  pendingImage=null; previewRect=null; selected=it; setTool("select"); hintFlash("Drag to move · drag a corner to resize");
+}
+document.getElementById("imgBtn").addEventListener("click",()=>{ fileInput.value=""; fileInput.click(); });
+fileInput.addEventListener("change",()=>{ const f=fileInput.files&&fileInput.files[0]; if(!f)return; const img=new Image();
+  img.onload=()=>{ pendingImage=img; setTool("image"); hintFlash("Drag a box to place the image (or tap once)"); }; img.src=URL.createObjectURL(f); });
+
+/* ---------------- export / import ---------------- */
+function serErases(it){ return it.erases&&it.erases.length?{erases:it.erases.map(e=>({base:e.base,pts:e.pts.map(p=>({x:p.x,y:p.y,w:p.w}))}))}:null; }
+function serHoles(it){ return it.holes&&it.holes.length?{holes:it.holes.map(h=>({x:h.x,y:h.y,r:h.r}))}:null; }
+function serClips(it){ return it.clips&&it.clips.length?{clips:it.clips.map(c=>({poly:c.poly.map(p=>({x:p.x,y:p.y}))}))}:null; }
+function serKeep(it){ return it.keep&&it.keep.length?{keep:it.keep.map(p=>({x:p.x,y:p.y}))}:null; }
+function serItem(it){ if(it.kind==="raster"){ let data=""; try{ if(it.src.toDataURL) data=it.src.toDataURL("image/png"); else { const cv=document.createElement("canvas"); cv.width=it.src.width; cv.height=it.src.height; cv.getContext("2d").drawImage(it.src,0,0); data=cv.toDataURL("image/png"); } }catch(e){}
+    return {kind:"raster",lyr:it.lyr,x:it.x,y:it.y,s:it.s,alpha:it.alpha,data,...serErases(it),...serClips(it),...serKeep(it)}; }
+  if(it.kind==="shape") return {kind:"shape",lyr:it.lyr,shape:it.shape,color:it.color,alpha:it.alpha,base:it.base,x0:it.x0,y0:it.y0,x1:it.x1,y1:it.y1,...serErases(it),...serClips(it),...serKeep(it)};
+  if(it.kind==="text") return {kind:"text",lyr:it.lyr,x:it.x,y:it.y,size:it.size,text:it.text,color:it.color,alpha:it.alpha,...serClips(it),...serKeep(it)};
+  if(it.kind==="flownode") return {kind:"flownode",lyr:it.lyr,fid:it.fid,shape:it.shape,color:it.color,fill:it.fill,alpha:it.alpha,base:it.base,x0:it.x0,y0:it.y0,x1:it.x1,y1:it.y1,text:it.text};
+  if(it.kind==="connector") return {kind:"connector",lyr:it.lyr,fid:it.fid,fromId:it.fromId,toId:it.toId,bend:it.bend,color:it.color,base:it.base};
+  return {kind:"stroke",lyr:it.lyr,mode:it.mode,color:it.color,alpha:it.alpha,base:it.base,pts:it.pts.map(p=>({x:p.x,y:p.y,w:p.w})),...serErases(it),...serHoles(it),...serClips(it),...serKeep(it)}; }
+function serNode(n){ return {items:n.items.map(serItem), children:n.children.map(c=>({x:c.x,y:c.y,k:c.k,node:serNode(c.node)}))}; }
+function download(name,blob){ const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download=name; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1500); }
+function pathToCurrent(){ const p=[]; let n=current; while(n.up){ const ch=n.up, idx=ch.parent.children.indexOf(ch); p.push(idx); n=ch.parent; } return p.reverse(); }
+function buildPayload(){ return {app:"infinite-zoom-studio",version:5,bg:bgColor,grid:gridMode,layers:cloneLayers(),active:gActive,view:{path:pathToCurrent(),camX,camY,sc:camScale/VIEW},root:serNode(root)}; }
+async function exportDrawing(){
+  const data=JSON.stringify(buildPayload());
+  try{ if(window.CompressionStream){ const stream=new Blob([data]).stream().pipeThrough(new CompressionStream("gzip"));
+    const blob=await new Response(stream).blob(); download("infinite-zoom-drawing.json.gz",blob); return; } }catch(e){}
+  download("infinite-zoom-drawing.json",new Blob([data],{type:"application/json"}));
+}
+function deserItem(o,node){ if(o.kind==="raster"){ const img=new Image(); const it={kind:"raster",lyr:o.lyr,x:o.x,y:o.y,s:o.s,alpha:o.alpha==null?1:o.alpha,src:img,erases:o.erases,clips:o.clips,keep:o.keep}; img.onload=()=>{ markDirty(node); dirty=true; }; img.src=o.data; return it; } return o; }
+function normLayer(L){ return {id:L.id,name:L.name||("Layer "+L.id),visible:L.visible!==false,locked:!!L.locked,opacity:L.opacity==null?1:L.opacity}; }
+function deserNode(o){ const n=makeNode();
+  n.items=(o.items||[]).map(it=>deserItem(it,n));
+  n.children=(o.children||[]).map(c=>{ const node=deserNode(c.node); const child={x:c.x,y:c.y,k:c.k,node,parent:n}; node.up=child; return child; }); n.dirty=true; n.bbox=undefined; return n; }
+function loadState(o){                                              // rebuild scene + camera from a parsed payload (shared by file import and autosave restore)
+  if(o.layers&&o.layers.length){ gLayers=o.layers.map(normLayer); gActive=o.active!=null?o.active:gLayers[0].id; }   // v5: global layer stack
+  else { const rl=o.root&&o.root.layers;                                  // v4 migration: fold the old per-frame stacks onto the root's, collapsing auto-created ones
+    gLayers=(rl&&rl.length)?rl.map(normLayer):[makeLayer("Layer 1")]; gActive=(o.root&&o.root.active!=null)?o.root.active:gLayers[0].id; }
+  for(const L of gLayers) lidCtr=Math.max(lidCtr,L.id);                    // keep the id counter ahead of loaded ids
+  root=deserNode(o.root); pVel={x:0,y:0}; selected=null; history.length=0; future.length=0; updateHist();
+  const valid=new Set(gLayers.map(L=>L.id)), def=gLayers[0].id;           // orphaned/legacy items fall onto the first layer
+  for(const n of allNodes()){ for(const it of n.items){ if(it.lyr==null||!valid.has(it.lyr)) it.lyr=def; if((it.kind==="flownode"||it.kind==="connector")&&it.fid) flowIdCtr=Math.max(flowIdCtr,it.fid); } regroup(n); }   // keep the flownode/connector id counter ahead of loaded ids
+  let cur=root, ok=true; const v=o.view||{};                       // restore camera + which frame you were in
+  for(const idx of (v.path||[])){ if(cur.children&&cur.children[idx]) cur=cur.children[idx].node; else { ok=false; break; } }
+  current=ok?cur:root; camX=v.camX||0; camY=v.camY||0; camScale=(v.sc||1)*VIEW; targetScale=camScale;
+  bgColor=o.bg||null; applyBg();                                   // restore saved canvas colour
+  if(o.grid!=null) setGrid(o.grid);                                // restore saved grid overlay
+  markDirty(root); dirty=true; refreshLayers(); }
+function importDrawing(text){ let o; try{ o=JSON.parse(text); }catch(e){ hintFlash("Couldn't read that file"); return; }
+  if(!o||!o.root){ hintFlash("Not a valid drawing file"); return; }
+  loadState(o); hintFlash("Drawing loaded"); }
+
+/* Autosave: persist the whole scene to localStorage so a closed/reopened tab resumes where
+   it left off. (Cookies can't hold this — ~4KB cap and sent on every request.) Writes are
+   debounced and skipped mid-interaction so transient draft/erase state never lands on disk. */
+const SAVE_KEY="infinidraw.autosave"; let saveTimer=null;
+function saveLocal(){
+  if(mode!==null||draft){ scheduleSave(); return; }                // an interaction is live — defer until it settles
+  try{ localStorage.setItem(SAVE_KEY,JSON.stringify(buildPayload())); }catch(e){}   // quota exceeded / private mode: silently skip
+}
+function scheduleSave(){ clearTimeout(saveTimer); saveTimer=setTimeout(saveLocal,1000); }
+function restoreLocal(){ let text; try{ text=localStorage.getItem(SAVE_KEY); }catch(e){ return; }
+  if(!text) return; let o; try{ o=JSON.parse(text); }catch(e){ return; } if(!o||!o.root) return; loadState(o); }
+addEventListener("visibilitychange",()=>{
+  if(document.visibilityState==="hidden"){ saveLocal(); return; }   // flush before the tab is backgrounded/closed
+  resize(); dirty=true;                                             // returning to the tab: mobile purges the canvas backing store while backgrounded, so force a full repaint instead of showing blank until refresh
+});
+addEventListener("pagehide",saveLocal);
+addEventListener("pageshow",e=>{ if(e.persisted){ resize(); dirty=true; } });   // bfcache restore keeps JS state but not the canvas pixels; just repaint
+document.getElementById("exportBtn").onclick=exportDrawing;
+document.getElementById("importBtn").onclick=()=>{ jsonFile.value=""; jsonFile.click(); };
+jsonFile.addEventListener("change",()=>{ const f=jsonFile.files&&jsonFile.files[0]; if(!f)return; const r=new FileReader();
+  r.onload=async()=>{ const buf=new Uint8Array(r.result); let text;
+    try{ if(buf.length>2&&buf[0]===0x1f&&buf[1]===0x8b&&window.DecompressionStream){
+        const stream=new Blob([buf]).stream().pipeThrough(new DecompressionStream("gzip")); text=await new Response(stream).text();
+      } else text=new TextDecoder().decode(buf);
+    }catch(e){ hintFlash("Couldn't read that file"); return; }
+    importDrawing(text); };
+  r.readAsArrayBuffer(f); });
+
+/* ---------------- pointer handling ---------------- */
+function stopMomentum(){ anim=null; targetScale=camScale; pVel.x=pVel.y=0; }
+canvas.addEventListener("pointerdown",e=>{
+  lastPointerType=e.pointerType||"mouse";
+  canvas.setPointerCapture(e.pointerId); const p=local(e); pointers.set(e.pointerId,p); cursor=p; stopMomentum();
+  mvVel={x:0,y:0}; mvLast={x:p.x,y:p.y,t:performance.now()};
+  if(pointers.size===2){ if(draft){applyRemove(current,draft);draft=null; for(const md of mirrorDrafts) applyRemove(current,md.item); mirrorDrafts=[]; mirrorBefore=null;} regionDraft=null; commitErase(); mode="pinch";
+    const[a,b]=[...pointers.values()]; pinchStart={dist:Math.hypot(a.x-b.x,a.y-b.y),cx:(a.x+b.x)/2,cy:(a.y+b.y)/2,_t:performance.now()}; dirty=true; return; }
+  const wantPan=tool==="hand"||spaceHeld||e.button===1||e.button===2;
+  if(wantPan){ mode="pan"; panLast=p; setCursor(); return; }
+  if(e.altKey&&(tool==="pen"||tool==="brush"||tool==="marker"||tool==="line"||tool==="rect"||tool==="ellipse")){ sampleColorAt(p); return; }   // Alt-click samples a colour without leaving the paint tool
+  if(curLayer().locked&&(tool==="pen"||tool==="brush"||tool==="marker"||tool==="line"||tool==="rect"||tool==="ellipse"||tool==="text"||tool==="region"||tool==="image"||tool==="flownode"||tool==="connect")){ hintFlash("Layer “"+curLayer().name+"” is locked"); return; }
+  // Deep-zoom drawing spawns nested detail lazily — only now, when a mark is actually made — so zooming alone never rebases into an empty frame.
+  if((tool==="pen"||tool==="brush"||tool==="marker"||tool==="line"||tool==="rect"||tool==="ellipse"||tool==="text"||tool==="region"||tool==="image"||tool==="flownode"||tool==="connect")&&camScale>=VIEW/CHILD_K) reframe(true);
+  if(tool==="pen"||tool==="brush"||tool==="marker"){ mode="draw"; lastMoveT=performance.now(); lastW=0; snapshotScene(); startStroke(p,tool,e); }
+  else if(tool==="line"||tool==="rect"||tool==="ellipse"){ mode="shape"; snapshotScene(); startShape(p,tool); }
+  else if(tool==="flownode"){ mode="shape"; snapshotScene(); startFlowNode(p); }
+  else if(tool==="connect"){ mode="connect"; snapshotScene(); startConnect(p); }
+  else if(tool==="eraser"){ mode="erase"; eraseSnap=new Map(); eraseLast=new Map(); eraseSample(p); }
+  else if(tool==="select"){ selectPointerDown(p); }
+  else if(tool==="region"){ mode="region"; regionStart(p); }
+  else if(tool==="text"){ textToolTap(p); }
+  else if(tool==="eyedrop"){ sampleColorAt(p); }
+  else if(tool==="image"){ if(pendingImage){ mode="placeimg"; placeAnchor=p; previewRect={x:p.x,y:p.y,w:0,h:0}; } else { fileInput.value=""; fileInput.click(); } }
+});
+canvas.addEventListener("pointermove",e=>{
+  lastPointerType=e.pointerType||"mouse";
+  const p=local(e); cursor=p;
+  if(mvLast&&pointers.size<2){ const now=performance.now(),dt=Math.max(8,now-mvLast.t)/1000; mvVel.x=mvVel.x*0.6+((p.x-mvLast.x)/dt)*0.4; mvVel.y=mvVel.y*0.6+((p.y-mvLast.y)/dt)*0.4; mvLast={x:p.x,y:p.y,t:now}; }
+  if(!pointers.has(e.pointerId)){ dirty=true; return; }
+  pointers.set(e.pointerId,p);
+  if(mode==="pinch"&&pointers.size>=2){
+    const[a,b]=[...pointers.values()]; const dist=Math.hypot(a.x-b.x,a.y-b.y),cx=(a.x+b.x)/2,cy=(a.y+b.y)/2;
+    if(pinchStart.dist>0){ let ratio=Math.max(.2,Math.min(5,dist/pinchStart.dist)); const awx=wX(cx),awy=wY(cy); camScale*=ratio; camX=awx-(cx-W/2)/camScale; camY=awy-(cy-H/2)/camScale; }
+    camX-=(cx-pinchStart.cx)/camScale; camY-=(cy-pinchStart.cy)/camScale;
+    const nowp=performance.now(); if(pinchStart._t){ const dt=Math.max(8,nowp-pinchStart._t)/1000; mvVel.x=mvVel.x*0.6+((cx-pinchStart.cx)/dt)*0.4; mvVel.y=mvVel.y*0.6+((cy-pinchStart.cy)/dt)*0.4; }
+    pinchStart={dist,cx,cy,_t:nowp}; targetScale=camScale; reframe(); dirty=true;
+  }else if(mode==="pan"&&panLast){ camX-=(p.x-panLast.x)/camScale; camY-=(p.y-panLast.y)/camScale; panLast=p; dirty=true; }
+  else if(mode==="draw"){ const evs=e.getCoalescedEvents?e.getCoalescedEvents():null; if(evs&&evs.length){ for(const ev of evs) extendStroke(local(ev),ev); } else extendStroke(p,e); }
+  else if(mode==="shape"){ extendShape(p); }
+  else if(mode==="connect"){ extendConnect(p); }
+  else if(mode==="bendConnector"){ dragBend(p); }
+  else if(mode==="erase"){ const evs=e.getCoalescedEvents?e.getCoalescedEvents():null; if(evs&&evs.length){ for(const ev of evs) eraseSample(local(ev)); } else eraseSample(p); dirty=true; }  // always redraw so the cursor ring tracks the drag
+  else if(mode==="move"){ moveSel(p); }
+  else if(mode==="resize"){ resizeSel(p); }
+  else if(mode==="region"){ regionExtend(p); }
+  else if(mode==="placeimg"&&placeAnchor){ previewRect={x:Math.min(p.x,placeAnchor.x),y:Math.min(p.y,placeAnchor.y),w:Math.abs(p.x-placeAnchor.x),h:Math.abs(p.y-placeAnchor.y)}; dirty=true; }
+  else dirty=true;
+});
+function release(e){
+  pointers.delete(e.pointerId);
+  if(mode==="draw"||mode==="shape"||mode==="connect"){ commitDraft(); mode=null; }
+  else if(mode==="erase"){ commitErase(); mode=null; }
+  else if(mode==="move"||mode==="resize"||mode==="bendConnector"){ endTransform(); mode=null; }
+  else if(mode==="region"){ regionCommit(); mode=null; }
+  else if(mode==="placeimg"){ placeImage(previewRect||{x:cursor.x,y:cursor.y,w:0,h:0}); placeAnchor=null; mode=null; }
+  else if(mode==="pinch"){ if(pointers.size===1){ mode="pan"; panLast=[...pointers.values()][0]; mvLast={x:panLast.x,y:panLast.y,t:performance.now()}; } else if(pointers.size===0){ mode=null; pVel={x:mvVel.x,y:mvVel.y}; } }
+  else if(mode==="pan"){ if(pointers.size===0){ mode=null; panLast=null; pVel={x:mvVel.x,y:mvVel.y}; } }
+  if(lastPointerType==="touch"&&pointers.size===0) cursor=null;   // no hover on touch — drop the loupe when the finger lifts
+  setCursor(); dirty=true; if(pointers.size===0) scheduleSave();  // persist camera/content once the gesture (and any coast) settles
+}
+canvas.addEventListener("pointerup",release);
+canvas.addEventListener("pointercancel",release);
+canvas.addEventListener("pointerleave",e=>{ if(!pointers.has(e.pointerId)){ cursor=null; dirty=true; } });
+canvas.addEventListener("wheel",e=>{ e.preventDefault(); anim=null; const p=local(e); cursor=p;
+  if(tool==="loupe"){ adjustLoupe(Math.exp(-e.deltaY*0.003)); return; }   // scroll adjusts the lens, not the canvas
+  wheelZoom(p.x,p.y,Math.exp(-e.deltaY*(e.ctrlKey?0.012:0.0016))); scheduleSave(); },{passive:false});
+canvas.addEventListener("contextmenu",e=>e.preventDefault());
+canvas.addEventListener("dblclick",e=>{ if(tool!=="select") return; const p=local(e); const it=pickFlowNode(p.x,p.y); if(it){ selected=it; beginEditText(it,false); } });
+
+/* ---------------- keyboard ---------------- */
+addEventListener("keydown",e=>{
+  if(e.code==="Tab"){ e.preventDefault(); toggleUI(); return; }
+  if(e.code==="Space"&&!spaceHeld){ spaceHeld=true; setCursor(); e.preventDefault(); return; }
+  const mod=e.metaKey||e.ctrlKey;
+  if(mod&&e.key.toLowerCase()==="z"){ e.preventDefault(); e.shiftKey?redo():undo(); return; }
+  if(mod&&e.key.toLowerCase()==="y"){ e.preventDefault(); redo(); return; }
+  if(mod&&e.key.toLowerCase()==="s"){ e.preventDefault(); exportDrawing(); return; }
+  if(e.target&&(e.target.tagName==="INPUT"||e.target.tagName==="TEXTAREA")) return;   // typing in a field / the text editor: leave native keys alone
+  if(mod&&e.key.toLowerCase()==="c"){ e.preventDefault(); copySelection(); return; }
+  if(mod&&e.key.toLowerCase()==="v"){ e.preventDefault(); pasteClipboard(); return; }
+  if(mod&&e.key.toLowerCase()==="d"){ e.preventDefault(); duplicateSelection(); return; }
+  if((e.key==="Delete"||e.key==="Backspace")&&(selected||groupSel)){ e.preventDefault(); deleteSelected(); return; }
+  const k=e.key.toLowerCase(), map={p:"pen",b:"brush",m:"marker",l:"line",r:"rect",o:"ellipse",v:"select",e:"eraser",h:"hand",g:"loupe",t:"text",k:"eyedrop"};
+  if(workMode){ map.n="flownode"; map.c="connect"; }   // Node/Connect shortcuts only do anything once their tools are actually on the toolbar
+  if(k==="i"){ document.getElementById("imgBtn").click(); }
+  else if(k==="f"){ toggleFullscreen(); }
+  else if(k==="y"){ toggleLayers(); }
+  else if(map[k]) setTool(map[k]);
+  else if(k==="="||k==="+")zoomAction(1.3); else if(k==="-"||k==="_")zoomAction(1/1.3);
+});
+addEventListener("keyup",e=>{ if(e.code==="Space"){ spaceHeld=false; setCursor(); dirty=true; } });
+
+/* ---------------- toolbar ---------------- */
+const bar=document.getElementById("bar"), showTools=document.getElementById("showTools");
+function setTool(t){ if(t!=="text") finishTextEdit(); tool=t; document.querySelectorAll("[data-tool]").forEach(b=>b.classList.toggle("active",b.dataset.tool===t)); if(t!=="image"){ pendingImage=null; previewRect=null; } if(t!=="select"){ selected=null; groupSel=null; } if(t!=="region"){ regionDraft=null; closeRgPop(); } if(t!=="flownode") closeFnPop(); setCursor(); dirty=true; }
+function setCursor(){ canvas.style.cursor=(tool==="hand"||spaceHeld)?(mode==="pan"?"grabbing":"grab"):(tool==="loupe"?"none":(tool==="select"?"default":(tool==="text"?"text":"crosshair"))); }
+document.querySelectorAll("[data-tool]").forEach(b=>{ if(b.id==="imgBtn"||b.id==="regionBtn"||b.id==="flowNodeBtn") return; b.onclick=()=>setTool(b.dataset.tool); });
+
+/* Region-cut tool: first click selects it; clicking again (or the caret) opens the shape chooser. */
+const regionBtn=document.getElementById("regionBtn"), rgpop=document.getElementById("rgpop");
+function closeRgPop(){ const el=document.getElementById("rgpop"); if(el) el.hidden=true; }
+function openRgPop(){ rgpop.querySelectorAll(".rgshape").forEach(b=>b.classList.toggle("active",b.dataset.shape===regionShape)); rgpop.hidden=false; placePopup(rgpop,regionBtn); }
+regionBtn.addEventListener("click",()=>{ if(tool!=="region"){ setTool("region"); hintFlash("Region cut ("+regionShape+") — drag to lift a piece. Click the tool again to change shape."); } else if(rgpop.hidden) openRgPop(); else closeRgPop(); });
+rgpop.querySelectorAll(".rgshape").forEach(b=>{ b.addEventListener("click",()=>{ regionShape=b.dataset.shape; closeRgPop(); hintFlash("Region shape: "+regionShape); }); });
+
+/* Node tool: same first-click-selects / second-click-opens-shape-chooser pattern as region-cut. */
+const flowNodeBtn=document.getElementById("flowNodeBtn"), fnpop=document.getElementById("fnpop");
+function closeFnPop(){ const el=document.getElementById("fnpop"); if(el) el.hidden=true; }
+function openFnPop(){ fnpop.querySelectorAll(".fnshape").forEach(b=>b.classList.toggle("active",b.dataset.fnshape===flowShape)); fnpop.hidden=false; placePopup(fnpop,flowNodeBtn); }
+flowNodeBtn.addEventListener("click",()=>{ if(tool!=="flownode"){ setTool("flownode"); hintFlash("Node ("+flowShape+") — drag to place, then type a label. Click the tool again to change shape."); } else if(fnpop.hidden) openFnPop(); else closeFnPop(); });
+fnpop.querySelectorAll(".fnshape").forEach(b=>{ b.addEventListener("click",()=>{ flowShape=b.dataset.fnshape; closeFnPop(); hintFlash("Node shape: "+flowShape); }); });
+rgpop.addEventListener("pointerdown",e=>e.stopPropagation());
+addEventListener("pointerdown",e=>{ if(!rgpop.hidden && !rgpop.contains(e.target) && !regionBtn.contains(e.target)) closeRgPop(); });
+fnpop.addEventListener("pointerdown",e=>e.stopPropagation());
+addEventListener("pointerdown",e=>{ if(!fnpop.hidden && !fnpop.contains(e.target) && !flowNodeBtn.contains(e.target)) closeFnPop(); });
+let uiHidden=false;
+function toggleUI(){ uiHidden=!uiHidden; bar.style.display=uiHidden?"none":"flex"; showTools.style.display=uiHidden?"flex":"none"; }
+document.getElementById("hideBtn").onclick=toggleUI; showTools.onclick=toggleUI;
+
+/* Fullscreen toggle — swaps the icon between "expand" and "collapse" as state changes. */
+const fsBtn=document.getElementById("fsBtn");
+const FS_EXPAND='<path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M16 3h3a2 2 0 0 1 2 2v3"/><path d="M8 21H5a2 2 0 0 1-2-2v-3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/>';
+const FS_COLLAPSE='<path d="M3 8h3a2 2 0 0 0 2-2V3"/><path d="M21 8h-3a2 2 0 0 1-2-2V3"/><path d="M3 16h3a2 2 0 0 1 2 2v3"/><path d="M21 16h-3a2 2 0 0 0-2 2v3"/>';
+function toggleFullscreen(){ if(document.fullscreenElement||document.webkitFullscreenElement){ (document.exitFullscreen||document.webkitExitFullscreen).call(document); }
+  else { const el=document.documentElement; (el.requestFullscreen||el.webkitRequestFullscreen).call(el); } }
+function syncFsIcon(){ const on=!!(document.fullscreenElement||document.webkitFullscreenElement);
+  fsBtn.querySelector("svg").innerHTML=on?FS_COLLAPSE:FS_EXPAND; fsBtn.title=on?"Exit fullscreen (F)":"Fullscreen (F)"; }
+fsBtn.onclick=toggleFullscreen;
+document.addEventListener("fullscreenchange",syncFsIcon); document.addEventListener("webkitfullscreenchange",syncFsIcon);
+
+/* Place a pop-out (slider / shape chooser) beside its toolbar button, on the side the bar
+   is docked to, clamped on-screen. Shared by the size/opacity and region-shape popups. */
+function placePopup(el,anchor){
+  const r=anchor.getBoundingClientRect(), pw=el.offsetWidth, ph=el.offsetHeight;
+  const dock=bar.classList.contains("dock-left")?"left":bar.classList.contains("dock-right")?"right"
+    :bar.classList.contains("dock-bottom")?"bottom":"top";
+  let left,top;
+  if(dock==="left"){ left=r.right+8; top=r.top+r.height/2-ph/2; }
+  else if(dock==="right"){ left=r.left-pw-8; top=r.top+r.height/2-ph/2; }
+  else if(dock==="bottom"){ left=r.left+r.width/2-pw/2; top=r.top-ph-8; }
+  else { left=r.left+r.width/2-pw/2; top=r.bottom+8; }
+  el.style.left=Math.max(8,Math.min(innerWidth-pw-8,left))+"px";
+  el.style.top=Math.max(8,Math.min(innerHeight-ph-8,top))+"px";
+}
+
+/* The "show tools" restore control mirrors the bar's own dock + anchored state, so a
+   minimised anchored bar comes back as a flush edge tab (chevron pointing the way it'll
+   open) rather than the free-floating pencil pill used when the bar itself floats. */
+const TOOLS_ICON='<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>';
+const CHEV_ICON={top:'<path d="m6 9 6 6 6-6"/>',bottom:'<path d="m18 15-6-6-6 6"/>',left:'<path d="m9 18 6-6-6-6"/>',right:'<path d="m15 18-6-6 6-6"/>'};
+function syncShowTools(){
+  const side=DOCKS.find(d=>bar.classList.contains("dock-"+d))||"top", anchored=bar.classList.contains("anchored");
+  showTools.classList.remove("dock-top","dock-bottom","dock-left","dock-right","anchored");
+  if(anchored) showTools.classList.add("anchored","dock-"+side);
+  showTools.querySelector("svg").innerHTML=anchored?CHEV_ICON[side]:TOOLS_ICON;
+  showTools.title=anchored?"Show toolbar ("+side+" edge)":"Show tools (Tab)";
+}
+/* Floating utility panels (Settings, Layers) default to a top-right corner and can be
+   dragged anywhere — but a flush ANCHORED bar occupies real screen edge, and a panel left
+   at a stale dragged position after the window resizes can end up off-screen entirely.
+   These two guards keep a panel fully on-screen and nudge it clear of the anchored bar
+   whenever it's shown, whenever the bar's dock/style changes, and on every window resize. */
+function keepPanelOnScreen(el){
+  if(!el || el.hidden) return;
+  const r=el.getBoundingClientRect(); if(!r.width||!r.height) return;
+  const left=Math.max(8,Math.min(innerWidth-r.width-8,r.left));
+  const top=Math.max(8,Math.min(innerHeight-r.height-8,r.top));
+  el.style.left=left+"px"; el.style.top=top+"px"; el.style.right="auto";
+}
+function dodgeAnchoredBar(el){
+  if(!el || el.hidden) return;
+  if(bar.classList.contains("anchored")){
+    const br=bar.getBoundingClientRect(), r=el.getBoundingClientRect();
+    const overlap=r.left<br.right&&r.right>br.left&&r.top<br.bottom&&r.bottom>br.top;
+    if(overlap){
+      if(bar.classList.contains("dock-right")) el.style.left=Math.max(8,br.left-r.width-10)+"px";
+      else if(bar.classList.contains("dock-left")) el.style.left=Math.max(8,br.right+10)+"px";
+      else if(bar.classList.contains("dock-top")) el.style.top=Math.max(8,br.bottom+10)+"px";
+      else if(bar.classList.contains("dock-bottom")) el.style.top=Math.max(8,br.top-r.height-10)+"px";
+      el.style.right="auto";
+    }
+  }
+  keepPanelOnScreen(el);
+}
+function repositionFloatingPanels(){
+  dodgeAnchoredBar(document.getElementById("spanel"));
+  dodgeAnchoredBar(document.getElementById("lpanel"));
+}
+addEventListener("resize",repositionFloatingPanels);
+
+/* Toolbar position: which screen edge the bar docks to, chosen from Settings rather than
+   dragged — top/bottom stay horizontal, left/right become a vertical column. */
+const DOCKS=["top","bottom","left","right"];
+const dockBtns={top:document.getElementById("dockTopBtn"),bottom:document.getElementById("dockBottomBtn"),
+  left:document.getElementById("dockLeftBtn"),right:document.getElementById("dockRightBtn")};
+function setDock(side){ if(!DOCKS.includes(side)) side="top";
+  bar.classList.remove("dock-top","dock-bottom","dock-left","dock-right"); bar.classList.add("dock-"+side);
+  for(const d of DOCKS) dockBtns[d].classList.toggle("active",d===side);
+  try{ localStorage.setItem("infinidraw.dock",side); }catch(e){} syncShowTools(); repositionFloatingPanels(); }
+setDock((()=>{ try{ return localStorage.getItem("infinidraw.dock"); }catch(e){ return null; } })()||"top");
+for(const d of DOCKS) dockBtns[d].onclick=()=>setDock(d);
+
+/* Toolbar style: "floating" is today's margined, freely-dragged pill; "anchored" pins it
+   flush against whichever edge it's docked to (still draggable between edges, still
+   hideable via the same hide/minimise control). Independent of — and combined with — dock side. */
+const uiFloatBtn=document.getElementById("uiFloatBtn"), uiAnchorBtn=document.getElementById("uiAnchorBtn");
+function setUiStyle(style){ style=style==="anchored"?"anchored":"floating";
+  bar.classList.toggle("anchored",style==="anchored");
+  uiFloatBtn.classList.toggle("active",style==="floating"); uiAnchorBtn.classList.toggle("active",style==="anchored");
+  try{ localStorage.setItem("infinidraw.uistyle",style); }catch(e){} syncShowTools(); repositionFloatingPanels(); }
+setUiStyle((()=>{ try{ return localStorage.getItem("infinidraw.uistyle"); }catch(e){ return null; } })()||"floating");
+uiFloatBtn.onclick=()=>setUiStyle("floating"); uiAnchorBtn.onclick=()=>setUiStyle("anchored");
+
+/* Mode: Creative (free-form drawing) vs Work (flowchart/system-design). Work just unlocks the
+   Node/Connect tools on the toolbar alongside everything else — nothing is hidden or replaced. */
+const modeCreativeBtn=document.getElementById("modeCreativeBtn"), modeWorkBtn=document.getElementById("modeWorkBtn");
+function setWorkMode(on){ workMode=!!on;
+  bar.classList.toggle("work-mode",workMode);
+  modeCreativeBtn.classList.toggle("active",!workMode); modeWorkBtn.classList.toggle("active",workMode);
+  if(!workMode&&(tool==="flownode"||tool==="connect")) setTool("select");   // its button just vanished — land somewhere still on the toolbar
+  try{ localStorage.setItem("infinidraw.workmode",workMode?"1":"0"); }catch(e){}
+}
+setWorkMode((()=>{ try{ return localStorage.getItem("infinidraw.workmode")==="1"; }catch(e){ return false; } })());
+modeCreativeBtn.onclick=()=>setWorkMode(false); modeWorkBtn.onclick=()=>setWorkMode(true);
+
+/* Mirror (symmetry drawing): off/v/h/both, applied to pen/brush/marker in startStroke/extendStroke. */
+const mirrorBtns={off:document.getElementById("mirrorOffBtn"),v:document.getElementById("mirrorVBtn"),h:document.getElementById("mirrorHBtn"),both:document.getElementById("mirrorBothBtn")};
+function setMirrorMode(m){ if(!mirrorBtns[m]) m="off"; mirrorMode=m;
+  for(const k in mirrorBtns) mirrorBtns[k].classList.toggle("active",k===m);
+  try{ localStorage.setItem("infinidraw.mirror",m); }catch(e){} dirty=true; }
+setMirrorMode((()=>{ try{ return localStorage.getItem("infinidraw.mirror"); }catch(e){ return null; } })()||"off");
+for(const k in mirrorBtns) mirrorBtns[k].onclick=()=>setMirrorMode(k);
+
+const inkDot=document.getElementById("inkDot");
+function setInk(hex){ color=hex; inkDot.style.background=hex; if(tool==="eraser")setTool("pen"); dirty=true; }
+/* Recent colours: the last dozen ink colours you committed, shown in the picker and persisted. */
+const cpRecents=document.getElementById("cpRecents"); let recents=[];
+function loadRecents(){ try{ recents=JSON.parse(localStorage.getItem("infinidraw.recents")||"[]")||[]; }catch(e){ recents=[]; } renderRecents(); }
+function pushRecent(hex){ hex=(hex||"").toLowerCase(); if(!/^#[0-9a-f]{6}$/.test(hex)) return;
+  recents=[hex,...recents.filter(c=>c!==hex)].slice(0,12); try{ localStorage.setItem("infinidraw.recents",JSON.stringify(recents)); }catch(e){} renderRecents(); }
+function renderRecents(){ cpRecents.innerHTML=""; for(const hex of recents){ const b=document.createElement("button"); b.className="rc"; b.style.background=hex; b.title=hex.toUpperCase();
+  b.onclick=()=>{ if(cpTarget==="bg"){ bgColor=hex; applyBg(); } else setInk(hex); pushRecent(hex); if(!cpick.hidden){ cpFromHex(hex); cpRender(); } }; cpRecents.appendChild(b); } }
+const bgDot=document.getElementById("bgDot");
+function applyBg(){ document.body.style.background=bgColor||""; if(bgColor) bgDot.style.background=bgColor; dirty=true; scheduleSave(); }  // erased/empty areas show the page bg through the transparent canvas
+
+/* Grid toggle: cycles off -> lines -> dots. The button icon swaps to match the mode, the
+   choice persists across sessions, and it rides along in exported/imported drawings. */
+const gridBtn=document.getElementById("gridBtn");
+const GRID_ICON=[
+  '<path d="M3 9h18"/><path d="M3 15h18"/><path d="M9 3v18"/><path d="M15 3v18"/>',                         // lines
+  '<circle cx="7" cy="7" r="1.3"/><circle cx="12" cy="7" r="1.3"/><circle cx="17" cy="7" r="1.3"/><circle cx="7" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="17" cy="12" r="1.3"/><circle cx="7" cy="17" r="1.3"/><circle cx="12" cy="17" r="1.3"/><circle cx="17" cy="17" r="1.3"/>'];  // dots
+function applyGrid(){
+  const labels=["off","lines","dots"]; gridBtn.title="Grid: "+labels[gridMode]+" — click to cycle lines / dots";
+  gridBtn.classList.toggle("active",gridMode>0);
+  const svg=gridBtn.querySelector("svg"); svg.setAttribute("fill",gridMode===2?"currentColor":"none");
+  svg.innerHTML=GRID_ICON[gridMode===2?1:0];
+  dirty=true;
+}
+function setGrid(m){ gridMode=((m%3)+3)%3; try{ localStorage.setItem("infinidraw.grid",gridMode); }catch(e){} applyGrid(); }
+gridBtn.onclick=()=>{ setGrid(gridMode+1); hintFlash("Grid: "+["off","lines","dots"][gridMode]); };
+setGrid((()=>{ try{ return +localStorage.getItem("infinidraw.grid")||0; }catch(e){ return 0; } })());
+
+/* ---------------- built-in colour picker ----------------
+   A self-contained HSV picker (saturation/value box + hue slider + hex field) so colour
+   selection is the full spectrum on every device — the native <input type=color> falls back
+   to a limited swatch grid on many phones. Drives either the ink colour or the canvas bg. */
+const inkBtn=document.getElementById("inkWrap"), bgBtn=document.getElementById("bgWrap");
+const cpick=document.getElementById("cpick"), cpSV=document.getElementById("cpSV"), cpSVDot=document.getElementById("cpSVDot"),
+      cpHue=document.getElementById("cpHue"), cpHex=document.getElementById("cpHex"), cpPrev=document.getElementById("cpPrev"), cpDone=document.getElementById("cpDone");
+let cpTarget="ink", cpH=270, cpS=0.6, cpV=0.9;
+function hsv2rgb(h,s,v){ h=(h%360)/60; const c=v*s,x=c*(1-Math.abs(h%2-1)),m=v-c; let r=0,gg=0,b=0;
+  if(h<1){r=c;gg=x;} else if(h<2){r=x;gg=c;} else if(h<3){gg=c;b=x;} else if(h<4){gg=x;b=c;} else if(h<5){r=x;b=c;} else {r=c;b=x;}
+  return [Math.round((r+m)*255),Math.round((gg+m)*255),Math.round((b+m)*255)]; }
+function rgb2hsv(r,g,b){ r/=255;g/=255;b/=255; const mx=Math.max(r,g,b),mn=Math.min(r,g,b),d=mx-mn; let h=0;
+  if(d){ if(mx===r)h=((g-b)/d)%6; else if(mx===g)h=(b-r)/d+2; else h=(r-g)/d+4; h*=60; if(h<0)h+=360; }
+  return [h,mx?d/mx:0,mx]; }
+const hex2=n=>n.toString(16).padStart(2,"0");
+function cpHexStr(){ const [r,g,b]=hsv2rgb(cpH,cpS,cpV); return "#"+hex2(r)+hex2(g)+hex2(b); }
+function cpFromHex(hex){ const c=/^#?([0-9a-f]{6}|[0-9a-f]{3})$/i.exec((hex||"").trim()); if(!c) return false;
+  let h=c[1]; if(h.length===3) h=h.split("").map(x=>x+x).join("");
+  const [H,S,V]=rgb2hsv(parseInt(h.slice(0,2),16),parseInt(h.slice(2,4),16),parseInt(h.slice(4,6),16)); cpH=H; cpS=S; cpV=V; return true; }
+function cpRender(){
+  const [hr,hg,hb]=hsv2rgb(cpH,1,1);
+  cpSV.style.background=`linear-gradient(to bottom,rgba(0,0,0,0),#000),linear-gradient(to right,#fff,rgba(255,255,255,0)),rgb(${hr},${hg},${hb})`;
+  cpSVDot.style.left=(cpS*100)+"%"; cpSVDot.style.top=((1-cpV)*100)+"%";
+  const hex=cpHexStr(); cpPrev.style.background=hex; cpSVDot.style.background=hex;
+  cpHue.value=Math.round(cpH); if(document.activeElement!==cpHex) cpHex.value=hex.slice(1).toUpperCase();
+}
+function cpApply(){ const hex=cpHexStr();
+  if(cpTarget==="ink"){ setInk(hex); }
+  else { bgColor=hex; applyBg(); } }
+function openPicker(target,anchor){ cpTarget=target;
+  cpFromHex(target==="ink"?color:(bgColor||"#f7f6f2")); cpRender(); cpick.hidden=false;
+  const r=anchor.getBoundingClientRect(), pw=cpick.offsetWidth, ph=cpick.offsetHeight;
+  let left=r.left+r.width/2-pw/2, top=r.bottom+8; if(top+ph>innerHeight-8) top=r.top-ph-8;   // flip above when no room below
+  cpick.style.left=Math.max(8,Math.min(innerWidth-pw-8,left))+"px"; cpick.style.top=Math.max(8,Math.min(innerHeight-ph-8,top))+"px"; }
+function closePicker(){ cpick.hidden=true; }
+function cpSVAt(cx,cy){ const r=cpSV.getBoundingClientRect();
+  cpS=Math.max(0,Math.min(1,(cx-r.left)/r.width)); cpV=1-Math.max(0,Math.min(1,(cy-r.top)/r.height)); cpRender(); cpApply(); }
+let cpDrag=false;
+cpSV.addEventListener("pointerdown",e=>{ cpDrag=true; cpSV.setPointerCapture(e.pointerId); cpSVAt(e.clientX,e.clientY); e.preventDefault(); });
+cpSV.addEventListener("pointermove",e=>{ if(cpDrag) cpSVAt(e.clientX,e.clientY); });
+cpSV.addEventListener("pointerup",()=>{ cpDrag=false; });
+cpSV.addEventListener("pointercancel",()=>{ cpDrag=false; });
+cpHue.addEventListener("input",()=>{ cpH=+cpHue.value; cpRender(); cpApply(); });
+cpHex.addEventListener("input",()=>{ if(cpFromHex(cpHex.value)){ cpRender(); cpApply(); } });
+cpDone.addEventListener("click",()=>{ if(cpTarget==="ink") pushRecent(color); closePicker(); });
+cpick.addEventListener("pointerdown",e=>e.stopPropagation());
+inkBtn.addEventListener("click",()=>openPicker("ink",inkBtn));
+bgBtn.addEventListener("click",()=>openPicker("bg",bgBtn));
+addEventListener("pointerdown",e=>{ if(!cpick.hidden && !cpick.contains(e.target) && !inkBtn.contains(e.target) && !bgBtn.contains(e.target)) closePicker(); });
+/* Size and opacity are icon buttons (in every dock orientation) that pop a slider open on
+   demand, so the control never widens the bar. The `size`/`opacity` vars are the source of
+   truth; setSize/setOpacity clamp and mirror the live value back into the open popup. */
+const sizeBtn=document.getElementById("sizeBtn"), opacityBtn=document.getElementById("opacityBtn");
+const slpop=document.getElementById("slpop"), slpopRange=document.getElementById("slpopRange"),
+      slpopLabel=document.getElementById("slpopLabel"), slpopVal=document.getElementById("slpopVal");
+let slpopTarget=null;
+function setSize(v){ size=Math.max(1,Math.min(60,Math.round(v)));
+  if(slpopTarget==="size"){ slpopRange.value=size; slpopVal.textContent=size; } dirty=true; }
+function setOpacity(pct){ pct=Math.max(5,Math.min(100,Math.round(pct))); opacity=pct/100;
+  if(slpopTarget==="opacity"){ slpopRange.value=pct; slpopVal.textContent=pct+"%"; } dirty=true; }
+const stabRange=document.getElementById("stabRange"), stabVal=document.getElementById("stabVal");
+function setSmooth(pct){ pct=Math.max(0,Math.min(90,Math.round(pct))); smoothing=pct/100;
+  stabRange.value=pct; stabVal.textContent=pct+"%"; }
+stabRange.oninput=()=>setSmooth(+stabRange.value);
+function closeSlPop(){ slpop.hidden=true; slpopTarget=null; }
+function openSlPop(target,anchor){
+  if(!slpop.hidden && slpopTarget===target){ closeSlPop(); return; }   // second tap on the same button closes it
+  slpopTarget=target;
+  if(target==="size"){ slpopLabel.textContent="Size"; slpopRange.min=1; slpopRange.max=60; slpopRange.value=size; slpopVal.textContent=size; }
+  else { const pct=Math.round(opacity*100); slpopLabel.textContent="Opacity"; slpopRange.min=5; slpopRange.max=100; slpopRange.value=pct; slpopVal.textContent=pct+"%"; }
+  slpop.hidden=false; placePopup(slpop,anchor);
+}
+slpopRange.oninput=e=>{ const v=+e.target.value; if(slpopTarget==="size") setSize(v); else setOpacity(v); };
+slpop.addEventListener("pointerdown",e=>e.stopPropagation());
+sizeBtn.addEventListener("click",()=>openSlPop("size",sizeBtn));
+opacityBtn.addEventListener("click",()=>openSlPop("opacity",opacityBtn));
+addEventListener("pointerdown",e=>{ if(!slpop.hidden && !slpop.contains(e.target) && !sizeBtn.contains(e.target) && !opacityBtn.contains(e.target)) closeSlPop(); });
+document.getElementById("undo").onclick=undo;
+document.getElementById("redo").onclick=redo;
+document.getElementById("zoomIn").onclick=()=>zoomAction(1.3);
+document.getElementById("zoomOut").onclick=()=>zoomAction(1/1.3);
+document.getElementById("zoomOuter").onclick=()=>zoomToExtreme(true);
+document.getElementById("zoomInner").onclick=()=>zoomToExtreme(false);
+document.getElementById("clear").onclick=()=>{ if(confirm("Start a new canvas? This clears everything.")){ root=makeNode(); current=root; gLayers=[makeLayer("Layer 1")]; gActive=gLayers[0].id; camX=camY=0; camScale=VIEW; targetScale=VIEW; pVel={x:0,y:0}; selected=null; history.length=0; future.length=0; updateHist(); dirty=true; saveLocal(); refreshLayers(); } };
+bar.addEventListener("pointerdown",e=>e.stopPropagation());
+showTools.addEventListener("pointerdown",e=>e.stopPropagation());
+
+const hint=document.getElementById("hint"); let hintTimer;
+function hintFlash(msg){ hint.classList.remove("fade"); hint.innerHTML="<span>"+msg+"</span>"; clearTimeout(hintTimer); hintTimer=setTimeout(()=>hint.classList.add("fade"),3200); }
+setTimeout(()=>hint.classList.add("fade"),7000);
+
+/* ---------------- layers panel ----------------
+   A movable tool window that manages the CURRENT frame's layer stack: reorder, show/hide,
+   lock, per-layer opacity, rename, add/duplicate/merge/delete. Rendered front-to-back to
+   read like Photoshop/GIMP (topmost row = frontmost layer). Layers are per-frame, so the
+   panel re-populates automatically as you zoom between the app's nested drawing frames. */
+const layersBtn=document.getElementById("layersBtn"), lpanel=document.getElementById("lpanel"),
+      lpList=document.getElementById("lpList"), lpHead=document.getElementById("lpHead"),
+      lpOpacity=document.getElementById("lpOpacity"), lpOpacityVal=document.getElementById("lpOpacityVal");
+let lpLastNode=null;
+const EYE_ON='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>';
+const EYE_OFF='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.9 5.1A9.5 9.5 0 0 1 12 5c6.5 0 10 7 10 7a17 17 0 0 1-3.2 3.9M6.3 6.3A16.6 16.6 0 0 0 2 12s3.5 7 10 7a9.4 9.4 0 0 0 4-.9"/><path d="m3 3 18 18"/></svg>';
+const LOCK_ON='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>';
+const LOCK_OFF='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-2"/></svg>';
+function updateLayerOpacity(){ const L=curLayer(); if(!L) return; const pct=Math.round(L.opacity*100); lpOpacity.value=pct; lpOpacityVal.textContent=pct+"%"; }
+const ZOUT_ICON='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="M21 3l-7 7"/><path d="M3 21l7-7"/></svg>';
+const ZIN_ICON='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14h6v6"/><path d="M20 10h-6V4"/><path d="M14 10l7-7"/><path d="M3 21l7-7"/></svg>';
+function renderLayers(){
+  lpLastNode=current; lpList.innerHTML="";
+  const layers=gLayers, present=layersWithItems();
+  for(let i=layers.length-1;i>=0;i--){ const L=layers[i];   // front (highest index) at the top of the list
+    const row=document.createElement("div");
+    row.className="lp-row"+(L.id===gActive?" active":"")+(L.visible?"":" hidden-lyr");
+    const eye=document.createElement("button"); eye.className="lp-eye"; eye.innerHTML=L.visible?EYE_ON:EYE_OFF; eye.title=L.visible?"Hide layer":"Show layer";
+    eye.onclick=e=>{ e.stopPropagation(); L.visible=!L.visible; dirty=true; scheduleSave(); renderLayers(); };
+    const lock=document.createElement("button"); lock.className="lp-lock"+(L.locked?" on":""); lock.innerHTML=L.locked?LOCK_ON:LOCK_OFF; lock.title=L.locked?"Unlock layer":"Lock layer";
+    lock.onclick=e=>{ e.stopPropagation(); L.locked=!L.locked; scheduleSave(); renderLayers(); };
+    const name=document.createElement("span"); name.className="lp-name"; name.textContent=L.name; name.title="Double-click to rename";
+    name.ondblclick=e=>{ e.stopPropagation(); const nn=prompt("Layer name",L.name); if(nn!=null){ L.name=nn.trim()||L.name; scheduleSave(); renderLayers(); } };
+    row.appendChild(eye); row.appendChild(lock); row.appendChild(name);
+    if(present.has(L.id)){   // fly to this layer's outermost / innermost drawing
+      const zout=document.createElement("button"); zout.className="lp-zoom"; zout.innerHTML=ZOUT_ICON; zout.title="Fly to this layer's outermost drawing";
+      zout.onclick=e=>{ e.stopPropagation(); zoomToExtreme(true,L.id); };
+      const zin=document.createElement("button"); zin.className="lp-zoom"; zin.innerHTML=ZIN_ICON; zin.title="Fly to this layer's innermost drawing";
+      zin.onclick=e=>{ e.stopPropagation(); zoomToExtreme(false,L.id); };
+      row.appendChild(zout); row.appendChild(zin);
+    }
+    row.onclick=()=>{ gActive=L.id; renderLayers(); };
+    lpList.appendChild(row);
+  }
+  updateLayerOpacity();
+}
+function refreshLayers(){ lpLastNode=current; if(lpanel && !lpanel.hidden) renderLayers(); }
+function toggleLayers(){ lpanel.hidden=!lpanel.hidden; layersBtn.classList.toggle("active",!lpanel.hidden);
+  if(!lpanel.hidden){ renderLayers(); dodgeAnchoredBar(lpanel); } }
+layersBtn.onclick=toggleLayers;
+document.getElementById("lpClose").onclick=toggleLayers;
+lpanel.addEventListener("pointerdown",e=>e.stopPropagation());   // keep panel clicks off the canvas
+
+/* Settings panel — holds the "set once and forget" preferences (canvas colour, grid,
+   stroke stabiliser, fullscreen) pulled off the toolbar. Same movable-window pattern as layers. */
+const settingsBtn=document.getElementById("settingsBtn"), spanel=document.getElementById("spanel"), spHead=document.getElementById("spHead");
+function toggleSettings(){ spanel.hidden=!spanel.hidden; settingsBtn.classList.toggle("active",!spanel.hidden);
+  if(!spanel.hidden) dodgeAnchoredBar(spanel); }
+settingsBtn.onclick=toggleSettings;
+document.getElementById("spClose").onclick=toggleSettings;
+spanel.addEventListener("pointerdown",e=>e.stopPropagation());   // keep panel clicks off the canvas
+let spDrag=null;
+spHead.addEventListener("pointerdown",e=>{ if(e.target.closest("#spClose")) return; spDrag={dx:e.clientX-spanel.offsetLeft,dy:e.clientY-spanel.offsetTop};
+  spHead.setPointerCapture(e.pointerId); e.preventDefault(); });
+spHead.addEventListener("pointermove",e=>{ if(!spDrag) return; let l=e.clientX-spDrag.dx, t=e.clientY-spDrag.dy;
+  l=Math.max(8,Math.min(innerWidth-spanel.offsetWidth-8,l)); t=Math.max(8,Math.min(innerHeight-spanel.offsetHeight-8,t));
+  spanel.style.left=l+"px"; spanel.style.top=t+"px"; spanel.style.right="auto"; });
+function spEndDrag(e){ if(!spDrag) return; spDrag=null; try{ spHead.releasePointerCapture(e.pointerId); }catch(_){} }
+spHead.addEventListener("pointerup",spEndDrag); spHead.addEventListener("pointercancel",spEndDrag);
+
+lpOpacity.oninput=()=>{ const L=curLayer(); if(!L) return; L.opacity=(+lpOpacity.value)/100; lpOpacityVal.textContent=lpOpacity.value+"%"; dirty=true; scheduleSave(); };
+
+/* Destructive ops (delete / merge / duplicate) snapshot the global layer stack AND every
+   frame's items, since a global layer edit touches items across the whole document. */
+function snapshotLayerState(){ return {layers:cloneLayers(),active:gActive,items:allNodes().map(n=>({node:n,items:n.items.map(cloneItem)}))}; }
+function restoreLayerState(s){ gLayers=s.layers.map(L=>({...L})); gActive=s.active;
+  for(const e of s.items){ e.node.items=e.items.map(cloneItem); e.node.dirty=true; e.node.bbox=undefined; } dirty=true; }
+function pushLayerHist(before){ pushHist({type:"layers",before,after:snapshotLayerState()}); }
+
+document.getElementById("lpAdd").onclick=()=>{ const L=makeLayer("Layer "+(gLayers.length+1)); const ai=layerIndex(gActive);
+  gLayers.splice(ai+1,0,L); gActive=L.id; scheduleSave(); renderLayers(); };
+document.getElementById("lpDup").onclick=()=>{ const src=curLayer(); if(!src) return;
+  const before=snapshotLayerState(); const L=makeLayer(src.name+" copy"); L.visible=src.visible; L.locked=src.locked; L.opacity=src.opacity;
+  gLayers.splice(layerIndex(src.id)+1,0,L);
+  for(const n of allNodes()) for(const it of n.items.slice()) if(it.lyr===src.id){ const c=cloneItem(it); addItemTo(n,c,L.id); }   // copy the layer's items in every frame
+  gActive=L.id; markAllDirty(); pushLayerHist(before); renderLayers(); };
+function moveLayer(dir){ const i=layerIndex(gActive), j=i+dir; if(i<0||j<0||j>=gLayers.length) return;
+  const t=gLayers[i]; gLayers[i]=gLayers[j]; gLayers[j]=t; regroupAll(); markAllDirty(); scheduleSave(); renderLayers(); }
+document.getElementById("lpUp").onclick=()=>moveLayer(1);     // up in the list = toward the front = higher index
+document.getElementById("lpDown").onclick=()=>moveLayer(-1);
+document.getElementById("lpMerge").onclick=()=>{ const i=layerIndex(gActive); if(i<=0){ hintFlash("No layer below to merge into"); return; }
+  const before=snapshotLayerState(); const L=gLayers[i], below=gLayers[i-1];
+  for(const n of allNodes()) for(const it of n.items) if(it.lyr===L.id) it.lyr=below.id;   // fold this layer's items into the one below, everywhere
+  gLayers.splice(i,1); gActive=below.id; regroupAll();
+  markAllDirty(); pushLayerHist(before); renderLayers(); };
+document.getElementById("lpDel").onclick=()=>{ if(gLayers.length<=1){ hintFlash("Can't delete the only layer"); return; }
+  const before=snapshotLayerState(); const L=curLayer(), idx=layerIndex(L.id);
+  for(const n of allNodes()) n.items=n.items.filter(it=>it.lyr!==L.id);   // drop the layer's items in every frame
+  gLayers.splice(idx,1); gActive=gLayers[Math.max(0,idx-1)].id; selected=null; groupSel=null;
+  markAllDirty(); pushLayerHist(before); renderLayers(); };
+
+/* Drag the panel header to move the whole window. */
+let lpDrag=null;
+lpHead.addEventListener("pointerdown",e=>{ if(e.target.closest("#lpClose")) return; lpDrag={dx:e.clientX-lpanel.offsetLeft,dy:e.clientY-lpanel.offsetTop};
+  lpHead.setPointerCapture(e.pointerId); e.preventDefault(); });
+lpHead.addEventListener("pointermove",e=>{ if(!lpDrag) return; let l=e.clientX-lpDrag.dx, t=e.clientY-lpDrag.dy;
+  l=Math.max(8,Math.min(innerWidth-lpanel.offsetWidth-8,l)); t=Math.max(8,Math.min(innerHeight-lpanel.offsetHeight-8,t));
+  lpanel.style.left=l+"px"; lpanel.style.top=t+"px"; lpanel.style.right="auto"; });
+function lpEndDrag(e){ if(!lpDrag) return; lpDrag=null; try{ lpHead.releasePointerCapture(e.pointerId); }catch(_){} }
+lpHead.addEventListener("pointerup",lpEndDrag); lpHead.addEventListener("pointercancel",lpEndDrag);
+
+/* ---------------- toolbar icon visibility ----------------
+   Every toolbar button except Settings and Hide (which must stay reachable, or the user
+   could strand themselves with no way back in) can be switched off here — the button is
+   just display:none'd on the real toolbar, so its keyboard shortcut (if any) still works. */
+const TOGGLE_ITEMS=[
+  {id:"pen",label:"Pen",sel:'[data-tool="pen"]'},
+  {id:"brush",label:"Brush",sel:'[data-tool="brush"]'},
+  {id:"marker",label:"Highlighter",sel:'[data-tool="marker"]'},
+  {id:"line",label:"Line",sel:'[data-tool="line"]'},
+  {id:"rect",label:"Rectangle",sel:'[data-tool="rect"]'},
+  {id:"ellipse",label:"Ellipse",sel:'[data-tool="ellipse"]'},
+  {id:"text",label:"Text",sel:'[data-tool="text"]'},
+  {id:"image",label:"Add image",sel:'#imgBtn'},
+  {id:"select",label:"Select",sel:'[data-tool="select"]'},
+  {id:"region",label:"Region cut",sel:'#regionBtn'},
+  {id:"flownode",label:"Node",sel:'#flowNodeBtn'},
+  {id:"connect",label:"Connect",sel:'[data-tool="connect"]'},
+  {id:"eraser",label:"Eraser",sel:'[data-tool="eraser"]'},
+  {id:"hand",label:"Pan",sel:'[data-tool="hand"]'},
+  {id:"loupe",label:"Magnifier",sel:'[data-tool="loupe"]'},
+  {id:"eyedrop",label:"Eyedropper",sel:'[data-tool="eyedrop"]'},
+  {id:"zoomOut",label:"Zoom out",sel:'#zoomOut'},
+  {id:"zoomIn",label:"Zoom in",sel:'#zoomIn'},
+  {id:"zoomOuter",label:"Fly to outermost",sel:'#zoomOuter'},
+  {id:"zoomInner",label:"Fly to innermost",sel:'#zoomInner'},
+  {id:"layersBtn",label:"Layers panel",sel:'#layersBtn'},
+  {id:"inkWrap",label:"Ink colour",sel:'#inkWrap'},
+  {id:"sizeBtn",label:"Brush size",sel:'#sizeBtn'},
+  {id:"opacityBtn",label:"Opacity",sel:'#opacityBtn'},
+  {id:"undo",label:"Undo",sel:'#undo'},
+  {id:"redo",label:"Redo",sel:'#redo'},
+  {id:"clear",label:"New canvas",sel:'#clear'},
+  {id:"exportBtn",label:"Export drawing",sel:'#exportBtn'},
+  {id:"importBtn",label:"Import drawing",sel:'#importBtn'},
+];
+let hiddenTools=new Set();
+function loadHiddenTools(){
+  try{ hiddenTools=new Set(JSON.parse(localStorage.getItem("infinidraw.hiddenTools")||"[]")); }catch(e){ hiddenTools=new Set(); }
+}
+function saveHiddenTools(){ try{ localStorage.setItem("infinidraw.hiddenTools",JSON.stringify([...hiddenTools])); }catch(e){} }
+function applyToolVisibility(){
+  for(const t of TOGGLE_ITEMS){ const el=bar.querySelector(t.sel); if(el) el.classList.toggle("tool-off",hiddenTools.has(t.id)); }
+}
+const spToolList=document.getElementById("spToolList"), spToolCount=document.getElementById("spToolCount");
+function renderToolToggles(){
+  spToolList.innerHTML="";
+  for(const t of TOGGLE_ITEMS){
+    const off=hiddenTools.has(t.id);
+    const row=document.createElement("div"); row.className="sp-trow"+(off?" tool-hidden":"");
+    const name=document.createElement("span"); name.className="sp-tname"; name.textContent=t.label;
+    const eye=document.createElement("button"); eye.className="lp-eye"; eye.innerHTML=off?EYE_OFF:EYE_ON;
+    eye.title=off?"Show "+t.label+" on the toolbar":"Hide "+t.label+" from the toolbar";
+    eye.onclick=()=>{ if(off) hiddenTools.delete(t.id); else hiddenTools.add(t.id);
+      saveHiddenTools(); applyToolVisibility(); renderToolToggles(); };
+    row.appendChild(name); row.appendChild(eye); spToolList.appendChild(row);
+  }
+  spToolCount.textContent=(TOGGLE_ITEMS.length-hiddenTools.size)+"/"+TOGGLE_ITEMS.length;
+}
+loadHiddenTools(); applyToolVisibility(); renderToolToggles();
+
+/* ---------------- hover tooltips ----------------
+   A single shared bubble, positioned per-target, standing in for the native title tooltip
+   (which is slow, unstyled, and can clip against a flush-anchored bar). The target's `title`
+   attribute is swapped for `data-tip` while shown so the OS tooltip never doubles up with it. */
+const tooltip=document.getElementById("tooltip");
+let tipTimer=null, tipEl=null;
+function tipPosition(el){
+  const r=el.getBoundingClientRect(), tw=tooltip.offsetWidth, th=tooltip.offsetHeight, pad=9;
+  let left=r.left+r.width/2-tw/2, top=r.bottom+pad;
+  if(bar.contains(el)){
+    if(bar.classList.contains("dock-left")){ left=r.right+pad; top=r.top+r.height/2-th/2; }
+    else if(bar.classList.contains("dock-right")){ left=r.left-tw-pad; top=r.top+r.height/2-th/2; }
+    else if(bar.classList.contains("dock-bottom")){ top=r.top-th-pad; }
+  }
+  if(top+th>innerHeight-6 && !bar.classList.contains("dock-left") && !bar.classList.contains("dock-right")) top=r.top-th-pad;
+  left=Math.max(6,Math.min(innerWidth-tw-6,left)); top=Math.max(6,Math.min(innerHeight-th-6,top));
+  tooltip.style.left=left+"px"; tooltip.style.top=top+"px";
+}
+function clearTip(){
+  clearTimeout(tipTimer); tipTimer=null;
+  if(tipEl && tipEl.dataset.tip && !tipEl.hasAttribute("title")) tipEl.setAttribute("title",tipEl.dataset.tip);
+  tipEl=null; tooltip.classList.remove("show");
+}
+document.addEventListener("pointerover",e=>{
+  const el=e.target.closest(".btn"); if(!el||el===tipEl) return;
+  clearTip();
+  const text=el.getAttribute("title"); if(!text) return;
+  tipEl=el;
+  tipTimer=setTimeout(()=>{
+    el.dataset.tip=text; el.removeAttribute("title");
+    tooltip.textContent=text; tooltip.classList.add("show"); tipPosition(el);
+  },350);
+});
+document.addEventListener("pointerout",e=>{
+  const el=e.target.closest(".btn"); if(!el||el!==tipEl) return;
+  if(el.contains(e.relatedTarget)) return;
+  clearTip();
+});
+document.addEventListener("pointerdown",clearTip);
+addEventListener("wheel",clearTip,{passive:true});
+addEventListener("resize",clearTip);
+
+/* ---------------- go ---------------- */
+resize(); setTool("pen"); loadRecents(); restoreLocal(); updateHist(); requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
