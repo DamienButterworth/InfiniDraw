@@ -1617,9 +1617,20 @@ function loadState(o){                                              // rebuild s
   bgColor=o.bg||null; applyBg();                                   // restore saved canvas colour
   if(o.grid!=null) setGrid(o.grid);                                // restore saved grid overlay
   markDirty(root); dirty=true; refreshLayers(); }
+/* A corrupt or incompatible saved/imported drawing must never brick the app — loadState runs
+   right before the render loop starts, so an uncaught throw here would silently freeze the
+   page (whatever was drawn just before the crash, e.g. a saved canvas colour, stays on screen
+   forever with nothing responding). Fall back to a blank canvas instead of leaving it hung. */
+function resetToBlankCanvas(){
+  root=makeNode(); current=root; gLayers=[makeLayer("Layer 1")]; gActive=gLayers[0].id;
+  camX=camY=0; camScale=VIEW; targetScale=VIEW; pVel={x:0,y:0}; selected=null;
+  history.length=0; future.length=0; updateHist();
+  bgColor=null; applyBg(); markDirty(root); dirty=true; refreshLayers();
+}
 function importDrawing(text){ let o; try{ o=JSON.parse(text); }catch(e){ hintFlash("Couldn't read that file"); return; }
   if(!o||!o.root){ hintFlash("Not a valid drawing file"); return; }
-  loadState(o); hintFlash("Drawing loaded"); }
+  try{ loadState(o); hintFlash("Drawing loaded"); }
+  catch(err){ console.error("Couldn't load that drawing:",err); resetToBlankCanvas(); hintFlash("That file wouldn't load — reset to a blank canvas"); } }
 
 /* Autosave: persist the whole scene to localStorage so a closed/reopened tab resumes where
    it left off. (Cookies can't hold this — ~4KB cap and sent on every request.) Writes are
@@ -1631,7 +1642,13 @@ function saveLocal(){
 }
 function scheduleSave(){ clearTimeout(saveTimer); saveTimer=setTimeout(saveLocal,1000); }
 function restoreLocal(){ let text; try{ text=localStorage.getItem(SAVE_KEY); }catch(e){ return; }
-  if(!text) return; let o; try{ o=JSON.parse(text); }catch(e){ return; } if(!o||!o.root) return; loadState(o); }
+  if(!text) return; let o; try{ o=JSON.parse(text); }catch(e){ return; } if(!o||!o.root) return;
+  try{ loadState(o); }
+  catch(err){                                    // this runs right before the render loop starts — an uncaught throw here would
+    console.error("Couldn't restore your last drawing, starting fresh:",err);   // freeze the page (e.g. a saved black canvas colour applies, then nothing ever responds)
+    try{ localStorage.removeItem(SAVE_KEY); }catch(e){}   // don't keep failing on this same save every reload
+    resetToBlankCanvas(); hintFlash("Couldn't load your last drawing — starting fresh");
+  } }
 addEventListener("visibilitychange",()=>{
   if(document.visibilityState==="hidden"){ saveLocal(); return; }   // flush before the tab is backgrounded/closed
   resize(); dirty=true;                                             // returning to the tab: mobile purges the canvas backing store while backgrounded, so force a full repaint instead of showing blank until refresh
