@@ -479,9 +479,15 @@
    a genuinely empty store, no race possible. */
 const RESET_KEYS=["infinidraw.autosave","infinidraw.dock","infinidraw.uistyle","infinidraw.workmode",
   "infinidraw.mirror","infinidraw.recents","infinidraw.grid","infinidraw.iconScale","infinidraw.hiddenTools","infinidraw.toolOrder"];
+// Captured (not just consumed here) because the actual drawing now lives in IndexedDB, which
+// restoreLocal() reads asynchronously further down — it needs to know a reset was requested so it
+// can wipe that store first instead of restoring from it. localStorage.removeItem(SAVE_KEY) here
+// still matters too: it clears out any pre-IndexedDB install's legacy blob before it can migrate.
+let FORCE_RESET=false;
 try{
   if(sessionStorage.getItem("infinidraw.forceReset")){
     sessionStorage.removeItem("infinidraw.forceReset");
+    FORCE_RESET=true;
     for(const k of RESET_KEYS) localStorage.removeItem(k);
   }
 }catch(e){}
@@ -521,6 +527,28 @@ function layerOf(it){ return gLayers.find(L=>L.id===it.lyr); }
 function cloneLayers(){ return gLayers.map(L=>({id:L.id,name:L.name,visible:L.visible,locked:L.locked,opacity:L.opacity})); }
 /* Walk every frame in the document (root + all descendants). */
 function allNodes(){ const out=[]; (function rec(n){ out.push(n); for(const c of n.children) rec(c.node); })(root); return out; }
+/* Frees pixel data — masked-item render caches and decoded raster bitmaps — for any node the
+   renderer hasn't reached in a while (renderNode stamps node.lastSeen every time it actually
+   processes a node, so anything currently on screen, or anywhere along the current zoom path,
+   keeps getting its stamp refreshed and is never a candidate here). Never touches item geometry
+   (pts/holes/shape coords/etc.) — that's cheap and stays resident so undo, hit-testing, and
+   everything else that assumes node.items is always fully there keeps working unchanged. Masked
+   items just drop their cache and let the already-proven cache-miss path in drawItems rebuild it
+   on next use; raster items swap their decoded image for a lightweight {width,height,evicted}
+   placeholder (see rasterOK/drawRasterItem) and only when the recoverable encoded bytes (_data)
+   are confirmed cached — never evicting the only copy of an image's pixels. */
+function evictIdleNodes(){
+  const now=performance.now();
+  for(const node of allNodes()){
+    if(now-(node.lastSeen||0)<=EVICT_IDLE_MS) continue;
+    for(const it of node.items){
+      // independent checks, not else-if: a masked raster item (has erases/clips/keep) can carry
+      // both a render cache AND a decoded bitmap at once, and both are separately evictable
+      if(it._cache) it._cache=null;
+      if(it.kind==="raster"&&it.src&&!it.src.evicted&&it._data) it.src={width:it.src.width,height:it.src.height,evicted:true};
+    }
+  }
+}
 function regroupAll(){ for(const n of allNodes()) regroup(n); }
 function markAllDirty(){ for(const n of allNodes()){ n.dirty=true; n.bbox=undefined; } dirty=true; }
 /* Insert an item at the top of a layer's contiguous block, preserving the grouping invariant
@@ -538,6 +566,11 @@ function addItemTo(node,it,layerId){
 function regroup(node){ node.items=node.items.map((it,i)=>[it,i]).sort((a,b)=>{ const d=layerIndex(a[0].lyr)-layerIndex(b[0].lyr); return d||a[1]-b[1]; }).map(p=>p[0]); }
 let camX=0, camY=0, camScale=1;
 const CHILD_K=1/6, UP_LEVELS=4, MAX_DEPTH=11;
+// Memory eviction (see evictIdleNodes): a node not reached by the renderer for EVICT_IDLE_MS gets
+// its items' pixel data (masked-item render caches, decoded raster bitmaps) freed — never the
+// underlying vector geometry, which is cheap and stays resident. EVICT_SWEEP_MS just paces how
+// often the (cheap) idle check itself runs; it doesn't affect how quickly any one node qualifies.
+const EVICT_IDLE_MS=60000, EVICT_SWEEP_MS=20000;
 let W=0,H=0,VIEW=1,dpr=1;
 
 /* ---------------- tools ---------------- */
@@ -602,7 +635,7 @@ function detachEmptyFrames(){
   })(root);
   return removed;
 }
-function rasterOK(it){ return it.src && it.src.width && it.src.height; }
+function rasterOK(it){ return it.src && it.src.width && it.src.height && !it.src.evicted; }   // evicted: a {width,height,evicted:true} placeholder, not a real decoded image — see evictIdleNodes
 function strokeBB(it){ let x0=1/0,y0=1/0,x1=-1/0,y1=-1/0; for(const p of it.pts){ const pad=(p.w||it.base)/2; if(p.x-pad<x0)x0=p.x-pad; if(p.y-pad<y0)y0=p.y-pad; if(p.x+pad>x1)x1=p.x+pad; if(p.y+pad>y1)y1=p.y+pad; } if(!it.pts.length){x0=y0=x1=y1=0;} return {x0,y0,x1,y1}; }
 function itemBounds(it){
   if(it.kind==="raster"){ const w=(it.src.width||1)*it.s,h=(it.src.height||1)*it.s; return {x0:it.x,y0:it.y,x1:it.x+w,y1:it.y+h}; }
@@ -716,7 +749,23 @@ function drawShapeItem(it,cam){
   else { g.ellipse((x0+x1)/2,(y0+y1)/2,Math.abs(x1-x0)/2,Math.abs(y1-y0)/2,0,0,6.2832); }
   g.stroke();
 }
-function drawRasterItem(it,cam){ if(!rasterOK(it)) return; const x=nSX(cam,it.x),y=nSY(cam,it.y),w=it.src.width*it.s*cam.scale,h=it.src.height*it.s*cam.scale; g.drawImage(it.src,x,y,w,h); }
+/* Kick off a fresh decode for an evicted raster item (see evictIdleNodes) and draw nothing this
+   frame — the exact same transient state a brand-new not-yet-loaded image already goes through
+   (deserItem's img.onload does the same thing), so no other code needs to know the difference.
+   The item's bbox/hit-test width+height never change across an evict/revive cycle (the placeholder
+   preserves them), only its drawability does, so this needs no markDirty — dirty=true is enough
+   to get the next frame to actually repaint once the image resolves. */
+function reviveRaster(it){
+  if(it._reviving||!it._data) return; it._reviving=true;
+  const img=new Image();
+  img.onload=()=>{ it.src=img; it._reviving=false; dirty=true; };
+  img.onerror=()=>{ it._reviving=false; };   // leave the placeholder in place; the next draw call just retries
+  img.src=it._data;
+}
+function drawRasterItem(it,cam){
+  if(it.src&&it.src.evicted){ reviveRaster(it); return; }
+  if(!rasterOK(it)) return; const x=nSX(cam,it.x),y=nSY(cam,it.y),w=it.src.width*it.s*cam.scale,h=it.src.height*it.s*cam.scale; g.drawImage(it.src,x,y,w,h);
+}
 function drawEraseMask(e,cam){                                              // one erase polyline, punched via destination-out on `g`
   const p=e.pts; if(!p.length) return;
   g.save(); g.globalCompositeOperation="destination-out"; g.globalAlpha=1; g.fillStyle=g.strokeStyle="#000";
@@ -726,9 +775,19 @@ function drawEraseMask(e,cam){                                              // o
     for(let i=1;i<p.length;i++) g.lineTo(nSX(cam,p[i].x),nSY(cam,p[i].y)); g.stroke(); }
   g.restore();
 }
-function drawHoleMask(h,cam){                                               // one erase hole, punched via destination-out on `g`
+/* Punches every hole in an array (or a suffix of one — see `from`) via destination-out on `g`. The
+   composite-op/alpha/fillStyle are IDENTICAL for every hole in a mask, so re-declaring and then
+   save()/restore()-ing that unchanging state on every single iteration was pure overhead once an
+   item's hole count gets into the thousands. Hoisting it out to once per call, and keeping each
+   hole as its own beginPath+arc+fill (not merged into one path — that changed the actual pixels
+   at overlaps and was rejected), measured 3x+ faster on a real 20k-hole rebuild with zero pixel
+   difference from the unbatched version. `from` skips the already-baked prefix for the incremental
+   patch path (see drawItems) without allocating a slice. */
+function drawHoleMasks(holes,cam,from){
+  if(!holes||!holes.length) return; from=from||0; if(from>=holes.length) return;
   g.save(); g.globalCompositeOperation="destination-out"; g.globalAlpha=1; g.fillStyle="#000";
-  g.beginPath(); g.arc(nSX(cam,h.x),nSY(cam,h.y),capPx(Math.max(.5,h.r*cam.scale)),0,6.2832); g.fill(); g.restore();
+  for(let i=from;i<holes.length;i++){ const h=holes[i]; g.beginPath(); g.arc(nSX(cam,h.x),nSY(cam,h.y),capPx(Math.max(.5,h.r*cam.scale)),0,6.2832); g.fill(); }
+  g.restore();
 }
 function drawClipMask(c,cam){                                               // one region-cut hole: a filled polygon punched via destination-out on `g`
   const p=c.poly; if(!p||p.length<3) return;
@@ -877,7 +936,7 @@ function drawItems(node,cam,itemsArr){
           const camFake={x:cache.camX+cache.rawFx0/cache.scale,y:cache.camY+cache.rawFy0/cache.scale,scale:cache.scale};
           const cctx=cache.canvas.getContext("2d"); cctx.setTransform(dpr,0,0,dpr,0,0);
           const og=g; g=cctx;
-          for(let hi=cache.holesBaked||0;hi<it.holes.length;hi++) drawHoleMask(it.holes[hi],camFake);
+          drawHoleMasks(it.holes,camFake,cache.holesBaked||0);
           g=og;
           cache.holesBaked=it.holes.length;
         }
@@ -920,7 +979,7 @@ function drawItems(node,cam,itemsArr){
       cc.width=fdw; cc.height=fdh;
       const cctx=cc.getContext("2d"); cctx.setTransform(dpr,0,0,dpr,0,0);
       const og=g; g=cctx;
-      drawOneItem(it,camFake); if(it.erases) for(const e of it.erases) drawEraseMask(e,camFake); if(it.holes) for(const h of it.holes) drawHoleMask(h,camFake); if(it.clips) for(const c of it.clips) drawClipMask(c,camFake); if(it.keep) drawKeepMask(it.keep,camFake);
+      drawOneItem(it,camFake); if(it.erases) for(const e of it.erases) drawEraseMask(e,camFake); drawHoleMasks(it.holes,camFake); if(it.clips) for(const c of it.clips) drawClipMask(c,camFake); if(it.keep) drawKeepMask(it.keep,camFake);
       g=og;
       it._cache={canvas:cc,scale:cam.scale,camX:cam.x,camY:cam.y,rawFx0:r.fx0,rawFy0:r.fy0,dw:fdw,dh:fdh,holesBaked:it.holes?it.holes.length:0};
       g=ctx; ctx.save(); ctx.globalAlpha=(it.alpha!=null?it.alpha:1)*lop; ctx.globalCompositeOperation="source-over"; ctx.setTransform(1,0,0,1,0,0);
@@ -933,13 +992,14 @@ function drawItems(node,cam,itemsArr){
     const dx=Math.floor(r.x*dpr),dy=Math.floor(r.y*dpr),dw=Math.ceil((r.x+r.w)*dpr)-dx,dh=Math.ceil((r.y+r.h)*dpr)-dy;
     g=lctx; lctx.setTransform(1,0,0,1,0,0); lctx.globalCompositeOperation="source-over"; lctx.globalAlpha=1; lctx.clearRect(dx,dy,dw,dh);
     lctx.setTransform(dpr,0,0,dpr,0,0); lctx.save(); lctx.beginPath(); lctx.rect(r.x,r.y,r.w,r.h); lctx.clip();
-    drawOneItem(it,cam); if(it.erases) for(const e of it.erases) drawEraseMask(e,cam); if(it.holes) for(const h of it.holes) drawHoleMask(h,cam); if(it.clips) for(const c of it.clips) drawClipMask(c,cam); if(it.keep) drawKeepMask(it.keep,cam); lctx.restore();
+    drawOneItem(it,cam); if(it.erases) for(const e of it.erases) drawEraseMask(e,cam); drawHoleMasks(it.holes,cam); if(it.clips) for(const c of it.clips) drawClipMask(c,cam); if(it.keep) drawKeepMask(it.keep,cam); lctx.restore();
     g=ctx; ctx.save(); ctx.globalAlpha=(it.alpha!=null?it.alpha:1)*lop; ctx.globalCompositeOperation="source-over"; ctx.setTransform(1,0,0,1,0,0);
     ctx.drawImage(layer,dx,dy,dw,dh,dx,dy,dw,dh); ctx.restore();
   }
   ctx.globalAlpha=1;
 }
 function renderNode(node,cam,depth){
+  node.lastSeen=performance.now();   // idle-eviction bookkeeping (evictIdleNodes) — anything actually reached by the renderer keeps this fresh automatically, nothing else to maintain
   // Children used to always render after (on top of) every one of the node's own items,
   // unconditionally — correct for content drawn before the child existed, but it meant anything
   // drawn on the parent AFTER the child was created (e.g. inking over a spot you already zoomed
@@ -1043,7 +1103,7 @@ function drawLodCover(f){                                                    // 
   lctx.setTransform(dpr,0,0,dpr,0,0); lctx.globalCompositeOperation="source-over"; lctx.globalAlpha=1;
   lctx.fillStyle=it.color; lctx.fillRect(0,0,W,H);                          // the covering ink, full viewport
   const og=g; g=lctx;
-  if(it.holes) for(const h of it.holes) drawHoleMask(h,cam);                // punch the holes (destination-out)
+  drawHoleMasks(it.holes,cam);                                              // punch the holes (destination-out)
   if(it.erases) for(const e of it.erases) drawEraseMask(e,cam);
   g=og;
   ctx.save(); ctx.setTransform(1,0,0,1,0,0); ctx.globalAlpha=it.alpha!=null?it.alpha:1; ctx.drawImage(layer,0,0); ctx.restore();
@@ -1243,8 +1303,11 @@ function physics(dt){
   if(Math.abs(pVel.x)>2||Math.abs(pVel.y)>2){ camX-=pVel.x*dt/camScale; camY-=pVel.y*dt/camScale; const d=Math.exp(-dt/PTAU); pVel.x*=d; pVel.y*=d; dirty=true; }
   else { pVel.x=pVel.y=0; }
 }
+let lastEvictSweep=0;
 function loop(){ const now=performance.now(); const dt=Math.min(0.05,(now-lastT)/1000)||0.016; lastT=now; if(anim) stepAnim(now); else physics(dt);
-  if(dirty){ draw(); dirty=false; } requestAnimationFrame(loop); }   // layers are global now, so no per-frame panel refresh on rebasing
+  if(dirty){ draw(); dirty=false; }
+  if(now-lastEvictSweep>EVICT_SWEEP_MS){ lastEvictSweep=now; evictIdleNodes(); }   // cheap idle check; only nodes actually past the threshold pay any real cost
+  requestAnimationFrame(loop); }   // layers are global now, so no per-frame panel refresh on rebasing
 
 /* ---------------- zoom ---------------- */
 function wheelZoom(px,py,mult){ anchorSX=px; anchorSY=py; targetScale=Math.max(camScale*1e-3,Math.min(camScale*1e3,targetScale*mult)); }
@@ -1299,7 +1362,13 @@ function stepAnim(now){
 }
 
 /* ---------------- history ---------------- */
-function pushHist(op){ history.push(op); future.length=0; updateHist(); scheduleSave(); }
+// "items"-type ops (paste/duplicate/region-cut) clone the whole node.items array twice each
+// (before + after) — with no cap, a very long single-tab session on a large drawing accumulates
+// these indefinitely until the tab closes (history isn't itself persisted — loadState always
+// starts it empty). Dropping the oldest entry past this many keeps memory bounded without
+// meaningfully affecting how many undos anyone actually uses in practice.
+const HIST_CAP=300;
+function pushHist(op){ history.push(op); if(history.length>HIST_CAP) history.shift(); future.length=0; updateHist(); scheduleSave(); }
 function applyRemove(node,it){ const i=node.items.indexOf(it); if(i>=0) node.items.splice(i,1); markDirty(node); }
 function undo(){ const op=history.pop(); if(!op) return;
   if(op.type==="add") applyRemove(op.node,op.item);
@@ -1541,14 +1610,32 @@ function splitStroke(it){
    heavy erasing redoes hundreds of fill ops on EVERY frame it's on screen, including while just
    panning past it. Dropping any hole that's fully contained in another (bigger-or-equal) one
    removes the redundant entries without changing what's visibly erased at all. */
+/* Checking every hole against every kept-so-far hole is O(n^2) — fine for the tens or hundreds a
+   normal erase session produces, but a stroke that's accumulated tens of thousands of holes over a
+   long editing history (each individually too small/scattered to be redundant with any other, so
+   nothing here actually gets dropped) turned this into a genuine multi-second main-thread freeze
+   on every single commitErase — measured 1.7s on a real 19,968-hole item that consolidated down to
+   19,968 unchanged. A hole can only cover (or be covered by) another within its own radius of it,
+   so a uniform spatial grid sized to the largest radius present turns "check against every kept
+   hole" into "check against the handful sharing or bordering its cell" — same containment test,
+   same biggest-first processing order, same output, ~90x faster on that real file (1.7s to <20ms). */
 function consolidateHoles(holes){
   if(!holes||holes.length<2) return holes;
   const sorted=holes.slice().sort((a,b)=>b.r-a.r);   // biggest first, so a hole only ever gets dropped for one that's already kept
+  const cell=Math.max(sorted[0].r*2,1e-9);           // >= the max distance at which containment is even possible (dist <= k.r-h.r <= k.r <= maxR)
+  const grid=new Map();                              // "cx,cy" -> kept holes whose cell key is that
   const kept=[];
   for(const h of sorted){
+    const cx=Math.floor(h.x/cell), cy=Math.floor(h.y/cell);
     let covered=false;
-    for(const k of kept){ if(k.r>=h.r && Math.hypot(h.x-k.x,h.y-k.y)+h.r<=k.r+1e-6){ covered=true; break; } }   // h's disk lies entirely inside k's
-    if(!covered) kept.push(h);
+    outer: for(let dx=-1;dx<=1;dx++) for(let dy=-1;dy<=1;dy++){
+      const arr=grid.get((cx+dx)+","+(cy+dy)); if(!arr) continue;
+      for(const k of arr){ if(k.r>=h.r && Math.hypot(h.x-k.x,h.y-k.y)+h.r<=k.r+1e-6){ covered=true; break outer; } }   // h's disk lies entirely inside k's
+    }
+    if(!covered){
+      kept.push(h);
+      const key=cx+","+cy; let arr=grid.get(key); if(!arr){ arr=[]; grid.set(key,arr); } arr.push(h);
+    }
   }
   return kept;
 }
@@ -1602,7 +1689,7 @@ function cloneItem(it){                                                     // d
   // z is copied through (not reassigned here) so an undo/redo "items" snapshot round-trips every
   // item's original z unchanged; addItemTo always re-stamps a fresh z anyway for the paste/cut/
   // duplicate call sites that want a brand-new one, so preserving it here never fights those.
-  if(it.kind==="raster") return {kind:"raster",lyr:it.lyr,x:it.x,y:it.y,s:it.s,alpha:it.alpha,src:it.src,z:it.z,erases:cloneErases(it.erases),clips:cloneClips(it.clips),keep:cloneKeep(it.keep)};
+  if(it.kind==="raster") return {kind:"raster",lyr:it.lyr,x:it.x,y:it.y,s:it.s,alpha:it.alpha,src:it.src,_data:it._data,z:it.z,erases:cloneErases(it.erases),clips:cloneClips(it.clips),keep:cloneKeep(it.keep)};
   if(it.kind==="shape") return {kind:"shape",lyr:it.lyr,shape:it.shape,color:it.color,alpha:it.alpha,base:it.base,x0:it.x0,y0:it.y0,x1:it.x1,y1:it.y1,z:it.z,erases:cloneErases(it.erases),clips:cloneClips(it.clips),keep:cloneKeep(it.keep)};
   if(it.kind==="text") return {kind:"text",lyr:it.lyr,x:it.x,y:it.y,size:it.size,text:it.text,color:it.color,alpha:it.alpha,z:it.z,clips:cloneClips(it.clips),keep:cloneKeep(it.keep)};
   if(it.kind==="flownode") return {kind:"flownode",lyr:it.lyr,fid:it.fid,shape:it.shape,color:it.color,fill:it.fill,alpha:it.alpha,base:it.base,x0:it.x0,y0:it.y0,x1:it.x1,y1:it.y1,text:it.text,z:it.z};
@@ -1834,8 +1921,13 @@ function serErases(it){ return it.erases&&it.erases.length?{erases:it.erases.map
 function serHoles(it){ return it.holes&&it.holes.length?{holes:it.holes.map(h=>({x:h.x,y:h.y,r:h.r}))}:null; }
 function serClips(it){ return it.clips&&it.clips.length?{clips:it.clips.map(c=>({poly:c.poly.map(p=>({x:p.x,y:p.y}))}))}:null; }
 function serKeep(it){ return it.keep&&it.keep.length?{keep:it.keep.map(p=>({x:p.x,y:p.y}))}:null; }
-function serItem(it){ if(it.kind==="raster"){ let data=""; try{ if(it.src.toDataURL) data=it.src.toDataURL("image/png"); else { const cv=document.createElement("canvas"); cv.width=it.src.width; cv.height=it.src.height; cv.getContext("2d").drawImage(it.src,0,0); data=cv.toDataURL("image/png"); } }catch(e){}
-    return {kind:"raster",lyr:it.lyr,x:it.x,y:it.y,s:it.s,alpha:it.alpha,data,z:it.z,...serErases(it),...serClips(it),...serKeep(it)}; }
+function serItem(it){ if(it.kind==="raster"){
+    // Prefer the cached encoded bytes over re-deriving them from .src every time: an evicted item
+    // (see evictIdleNodes) has no real decoded image to read pixels back out of any more, only this
+    // cache — and even for a resident item, this also means autosave (every ~1s of active editing)
+    // stops re-encoding every image on the canvas from scratch on every single debounce tick.
+    if(!it._data){ let data=""; try{ if(it.src.toDataURL) data=it.src.toDataURL("image/png"); else { const cv=document.createElement("canvas"); cv.width=it.src.width; cv.height=it.src.height; cv.getContext("2d").drawImage(it.src,0,0); data=cv.toDataURL("image/png"); } }catch(e){} if(data) it._data=data; }   // don't cache a failed attempt — let it retry next save instead of freezing on an empty string
+    return {kind:"raster",lyr:it.lyr,x:it.x,y:it.y,s:it.s,alpha:it.alpha,data:it._data||"",z:it.z,...serErases(it),...serClips(it),...serKeep(it)}; }
   if(it.kind==="shape") return {kind:"shape",lyr:it.lyr,shape:it.shape,color:it.color,alpha:it.alpha,base:it.base,x0:it.x0,y0:it.y0,x1:it.x1,y1:it.y1,z:it.z,...serErases(it),...serClips(it),...serKeep(it)};
   if(it.kind==="text") return {kind:"text",lyr:it.lyr,x:it.x,y:it.y,size:it.size,text:it.text,color:it.color,alpha:it.alpha,z:it.z,...serClips(it),...serKeep(it)};
   if(it.kind==="flownode") return {kind:"flownode",lyr:it.lyr,fid:it.fid,shape:it.shape,color:it.color,fill:it.fill,alpha:it.alpha,base:it.base,x0:it.x0,y0:it.y0,x1:it.x1,y1:it.y1,text:it.text,z:it.z};
@@ -1851,7 +1943,7 @@ async function exportDrawing(){
     const blob=await new Response(stream).blob(); download("infinite-zoom-drawing.json.gz",blob); return; } }catch(e){}
   download("infinite-zoom-drawing.json",new Blob([data],{type:"application/json"}));
 }
-function deserItem(o,node){ if(o.kind==="raster"){ const img=new Image(); const it={kind:"raster",lyr:o.lyr,x:o.x,y:o.y,s:o.s,alpha:o.alpha==null?1:o.alpha,src:img,z:o.z,erases:o.erases,clips:o.clips,keep:o.keep}; img.onload=()=>{ markDirty(node); dirty=true; }; img.src=o.data; return it; }
+function deserItem(o,node){ if(o.kind==="raster"){ const img=new Image(); const it={kind:"raster",lyr:o.lyr,x:o.x,y:o.y,s:o.s,alpha:o.alpha==null?1:o.alpha,src:img,_data:o.data,z:o.z,erases:o.erases,clips:o.clips,keep:o.keep}; img.onload=()=>{ markDirty(node); dirty=true; }; img.src=o.data; return it; }
   if(o.kind==="stroke"&&o.holes&&o.holes.length>1) o.holes=consolidateHoles(o.holes);   // one-time cleanup for drawings saved before consolidation existed — see commitErase
   return o; }
 function normLayer(L){ return {id:L.id,name:L.name||("Layer "+L.id),visible:L.visible!==false,locked:!!L.locked,opacity:L.opacity==null?1:L.opacity}; }
@@ -2214,13 +2306,60 @@ function importDrawing(text){ let o; try{ o=JSON.parse(text); }catch(e){ hintFla
   try{ loadState(o); hintFlash("Drawing loaded"); }
   catch(err){ console.error("Couldn't load that drawing:",err); resetToBlankCanvas(); hintFlash("That file wouldn't load — reset to a blank canvas"); } }
 
-/* Autosave: persist the whole scene to localStorage so a closed/reopened tab resumes where
-   it left off. (Cookies can't hold this — ~4KB cap and sent on every request.) Writes are
-   debounced and skipped mid-interaction so transient draft/erase state never lands on disk. */
-const SAVE_KEY="infinidraw.autosave"; let saveTimer=null;
+/* ---------------- persistence (IndexedDB) ----------------
+   Autosave used to write to localStorage, which caps out around 5-10MB per origin (varies by
+   browser) — and every image in a drawing is stored as a base64 data URL, ~33% bigger than its
+   raw bytes, so it doesn't take many pasted screenshots over a long-lived drawing to reach that
+   ceiling. Worse, the old code's quota-exceeded handling was a bare `catch(e){}`: once a drawing
+   grew past the limit, autosave would silently stop working forever with no indication to the
+   user — they'd keep drawing believing it was being saved. IndexedDB's quota is a share of free
+   disk space rather than a flat few MB, so realistic drawings — even years of heavy use — aren't
+   expected to hit it, and failures now actually surface (see saveLocal below) instead of vanishing.
+   One real trade-off from the move: localStorage.setItem is synchronous, so the old pagehide/
+   visibilitychange flush was guaranteed to land before an abrupt tab close finished it off.
+   IndexedDB transactions commit asynchronously — modern browsers do let a transaction that's
+   *started* synchronously inside a pagehide/unload handler run to completion, which is what
+   saveLocal relies on below, but it's not as ironclad a guarantee as the old synchronous write
+   was. Given the debounce is only 1s, the realistic exposure is "the last second of edits before
+   an abrupt kill," not the whole drawing. */
+const SAVE_KEY="infinidraw.autosave", IDB_NAME="infinidraw-store", IDB_STORE="kv";
+let saveTimer=null, idbOpenPromise=null, saveFailing=false, lastSaveFailFlash=0, persistRequested=false;
+function openIDB(){
+  if(idbOpenPromise) return idbOpenPromise;
+  idbOpenPromise=new Promise((resolve,reject)=>{
+    if(!window.indexedDB){ reject(new Error("indexedDB unavailable")); return; }
+    const req=indexedDB.open(IDB_NAME,1);
+    req.onupgradeneeded=()=>{ if(!req.result.objectStoreNames.contains(IDB_STORE)) req.result.createObjectStore(IDB_STORE); };
+    req.onsuccess=()=>resolve(req.result);
+    req.onerror=()=>reject(req.error);
+  });
+  return idbOpenPromise;
+}
+function idbGet(key){ return openIDB().then(db=>new Promise((resolve,reject)=>{
+  const req=db.transaction(IDB_STORE,"readonly").objectStore(IDB_STORE).get(key);
+  req.onsuccess=()=>resolve(req.result); req.onerror=()=>reject(req.error);
+})); }
+function idbSet(key,value){ return openIDB().then(db=>new Promise((resolve,reject)=>{
+  const tx=db.transaction(IDB_STORE,"readwrite"); tx.objectStore(IDB_STORE).put(value,key);
+  tx.oncomplete=()=>resolve(); tx.onerror=()=>reject(tx.error); tx.onabort=()=>reject(tx.error);
+})); }
+function idbDelete(key){ return openIDB().then(db=>new Promise((resolve,reject)=>{
+  const tx=db.transaction(IDB_STORE,"readwrite"); tx.objectStore(IDB_STORE).delete(key);
+  tx.oncomplete=()=>resolve(); tx.onerror=()=>reject(tx.error); tx.onabort=()=>reject(tx.error);
+})); }
 function saveLocal(){
   if(mode!==null||draft){ scheduleSave(); return; }                // an interaction is live — defer until it settles
-  try{ localStorage.setItem(SAVE_KEY,JSON.stringify(buildPayload())); }catch(e){}   // quota exceeded / private mode: silently skip
+  idbSet(SAVE_KEY,JSON.stringify(buildPayload())).then(()=>{
+    if(saveFailing){ saveFailing=false; hintFlash("Saving again — you're all set"); }
+    if(!persistRequested){ persistRequested=true;                  // best-effort: ask the browser not to evict this origin's storage under pressure
+      try{ navigator.storage&&navigator.storage.persist&&navigator.storage.persist(); }catch(e){} }
+  }).catch(err=>{
+    console.error("Autosave failed:",err);
+    saveFailing=true;
+    const now=Date.now();                                          // keep nagging while it keeps failing (every edit re-triggers this), but not on every single one
+    if(now-lastSaveFailFlash>30000){ lastSaveFailFlash=now;
+      hintFlash("Couldn't save — export a backup (Ctrl/Cmd+S) to be safe"); }
+  });
 }
 function scheduleSave(){ clearTimeout(saveTimer); saveTimer=setTimeout(saveLocal,1000); }
 /* Private tutorial override — for the author only, never for anyone else running this same
@@ -2232,15 +2371,28 @@ function scheduleSave(){ clearTimeout(saveTimer); saveTimer=setTimeout(saveLocal
    it in for local use, and reset it (running the script with no arguments) before committing
    or sharing this file. */
 const CUSTOM_TUTORIAL_DATA=null;   // TUTORIAL_DATA_MARKER - rewritten by set-tutorial.ps1, don't hand-edit this line
-function restoreLocal(){ let text; try{ text=localStorage.getItem(SAVE_KEY); }catch(e){ CUSTOM_TUTORIAL_DATA?loadState(CUSTOM_TUTORIAL_DATA):buildTutorial(); return; }   // storage inaccessible (private mode etc.) — there's no way this tab could have a session either way
-  if(!text){ CUSTOM_TUTORIAL_DATA?loadState(CUSTOM_TUTORIAL_DATA):buildTutorial(); return; }   // never saved before: a genuinely new user
-  let o; try{ o=JSON.parse(text); }catch(e){ return; } if(!o||!o.root) return;
-  try{ loadState(o); }
+function freshStart(){ CUSTOM_TUTORIAL_DATA?loadState(CUSTOM_TUTORIAL_DATA):buildTutorial(); }
+function finishRestore(text,onLoaded){
+  let o; try{ o=JSON.parse(text); }catch(e){ freshStart(); return; }
+  if(!o||!o.root){ freshStart(); return; }
+  try{ loadState(o); if(onLoaded) onLoaded(); }
   catch(err){                                    // this runs right before the render loop starts — an uncaught throw here would
     console.error("Couldn't restore your last drawing, starting fresh:",err);   // freeze the page (e.g. a saved black canvas colour applies, then nothing ever responds)
-    try{ localStorage.removeItem(SAVE_KEY); }catch(e){}   // don't keep failing on this same save every reload
+    idbDelete(SAVE_KEY).catch(()=>{});           // don't keep failing on this same save every reload
     resetToBlankCanvas(); hintFlash("Couldn't load your last drawing — starting fresh");
-  } }
+  }
+}
+function restoreLocal(){
+  if(FORCE_RESET){ idbDelete(SAVE_KEY).catch(()=>{}).then(freshStart); return; }   // hard reset: wipe the store rather than restore from it
+  idbGet(SAVE_KEY).then(text=>{
+    if(text){ finishRestore(text); return; }
+    let legacy=null; try{ legacy=localStorage.getItem(SAVE_KEY); }catch(e){}   // pre-IndexedDB install: migrate its blob in, but don't drop the only copy until the new one is confirmed written
+    if(legacy){ finishRestore(legacy,()=>{
+      idbSet(SAVE_KEY,legacy).then(()=>{ try{ localStorage.removeItem(SAVE_KEY); }catch(e){} }).catch(()=>{});
+    }); return; }
+    freshStart();
+  }).catch(err=>{ console.error("Couldn't open local storage, starting fresh:",err); freshStart(); });
+}
 addEventListener("visibilitychange",()=>{
   if(document.visibilityState==="hidden"){ saveLocal(); return; }   // flush before the tab is backgrounded/closed
   resize(); dirty=true;                                             // returning to the tab: mobile purges the canvas backing store while backgrounded, so force a full repaint instead of showing blank until refresh
