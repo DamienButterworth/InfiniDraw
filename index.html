@@ -1272,7 +1272,18 @@ function drawCursorRing(){
 
 /* ---------------- rebasing (hidden engine) ---------------- */
 function descendInto(c){ camScale*=c.k; targetScale*=c.k; camX=(camX-c.x)/c.k; camY=(camY-c.y)/c.k; current=c.node; selected=null; }
-function ascend(){ const up=current.up; camScale/=up.k; targetScale/=up.k; camX=up.x+camX*up.k; camY=up.y+camY*up.k; current=up.parent; selected=null; }
+function ascend(){ const up=current.up, leaving=current;
+  camScale/=up.k; targetScale/=up.k; camX=up.x+camX*up.k; camY=up.y+camY*up.k; current=up.parent; selected=null;
+  // A frame you just zoomed out of, that never got so much as a mark drawn in it (or in anything
+  // nested inside it), carries no information worth keeping — it's indistinguishable from "no
+  // frame exists here yet," which is exactly what zooming back in would recreate anyway. detachEmptyFrames
+  // (see there) already sweeps the whole tree after an explicit delete/erase/layer-delete, but it
+  // deliberately protects whatever node you're currently standing in — so a frame you emptied while
+  // still inside it only got cleaned up later, on the next unrelated edit elsewhere. This catches
+  // it the instant you actually leave, which is what "removed automatically" means here. Not
+  // pushed to undo history, same as navigation never is — there's nothing to lose by not tracking it.
+  if(!nodeHasContent(leaving)){ const idx=up.parent.children.indexOf(up); if(idx>=0){ up.parent.children.splice(idx,1); markDirty(up.parent); } }
+}
 function addChild(parent,x,y,k){ const node=makeNode(),child={x,y,k,node,parent,z:zSeq++}; node.up=child; parent.children.push(child); markDirty(parent); return child; }
 /* allowCreate: only true when the user actually starts drawing at deep zoom. Zooming/panning
    alone never spawns an empty child frame (which would swap the Layers panel out from under
@@ -1373,20 +1384,22 @@ function applyRemove(node,it){ const i=node.items.indexOf(it); if(i>=0) node.ite
 function undo(){ const op=history.pop(); if(!op) return;
   if(op.type==="add") applyRemove(op.node,op.item);
   else if(op.type==="erase"){ for(const r of op.removed) op.node.items.splice(Math.min(r.i,op.node.items.length),0,r.item); markDirty(op.node); }
-  else if(op.type==="verase"){ for(const c of op.itemChanges){ c.node.items=c.before.slice(); markDirty(c.node); }
-    for(let i=op.removed.length-1;i>=0;i--){ const r=op.removed[i]; r.parent.children.splice(r.index,0,r.child); markDirty(r.parent); } }   // re-attach pruned frames
+  else if(op.type==="verase"){ for(const c of op.itemChanges){ c.node.items=c.before.slice(); markDirty(c.node); } }
   else if(op.type==="transform"){ setGeom(op.item,op.before); markDirty(op.node); }
   else if(op.type==="items"){ op.node.items=op.before.slice(); markDirty(op.node); }
   else if(op.type==="layers"){ restoreLayerState(op.before); }
+  // Frames auto-pruned when they went empty (see detachEmptyFrames) — any op that removed content
+  // anywhere can carry this, not just erasing, so it's handled once here rather than per type.
+  if(op.removedFrames) for(let i=op.removedFrames.length-1;i>=0;i--){ const r=op.removedFrames[i]; r.parent.children.splice(r.index,0,r.child); markDirty(r.parent); }
   groupSel=null; future.push(op); updateHist(); dirty=true; scheduleSave(); refreshLayers(); }
 function redo(){ const op=future.pop(); if(!op) return;
   if(op.type==="add"){ addItemTo(op.node,op.item,op.item.lyr); markDirty(op.node); }
   else if(op.type==="erase"){ for(const r of [...op.removed].sort((a,b)=>b.i-a.i)){ const i=op.node.items.indexOf(r.item); if(i>=0) op.node.items.splice(i,1);} markDirty(op.node); }
-  else if(op.type==="verase"){ for(const c of op.itemChanges){ c.node.items=c.after.slice(); markDirty(c.node); }
-    for(const r of op.removed){ const i=r.parent.children.indexOf(r.child); if(i>=0) r.parent.children.splice(i,1); markDirty(r.parent); } }   // re-prune emptied frames
+  else if(op.type==="verase"){ for(const c of op.itemChanges){ c.node.items=c.after.slice(); markDirty(c.node); } }
   else if(op.type==="transform"){ setGeom(op.item,op.after); markDirty(op.node); }
   else if(op.type==="items"){ op.node.items=op.after.slice(); markDirty(op.node); }
   else if(op.type==="layers"){ restoreLayerState(op.after); }
+  if(op.removedFrames) for(const r of op.removedFrames){ const i=r.parent.children.indexOf(r.child); if(i>=0) r.parent.children.splice(i,1); markDirty(r.parent); }   // re-prune emptied frames
   groupSel=null; history.push(op); updateHist(); dirty=true; scheduleSave(); refreshLayers(); }
 function updateHist(){ document.getElementById("undo").disabled=!history.length; document.getElementById("redo").disabled=!future.length; }
 
@@ -1658,8 +1671,8 @@ function commitErase(){
       if(kept.length!==node.items.length){ node.items=kept; markDirty(node); }
     }
     for(const ic of itemChanges) ic.after=ic.node.items.map(cloneItem);
-    const removed=detachEmptyFrames();
-    pushHist({type:"verase",itemChanges,removed});
+    const removedFrames=detachEmptyFrames();
+    pushHist({type:"verase",itemChanges,removedFrames});
   }
   eraseSnap=eraseLast=null;
 }
@@ -1777,14 +1790,14 @@ function endTransform(){
   if(selected&&transformSnap){ const after=geomOf(selected); const changed=JSON.stringify(after)!==JSON.stringify(transformSnap); if(changed) pushHist({type:"transform",node:current,item:selected,before:transformSnap,after}); } transformSnap=null; resizeInfo=null; dragLast=null; bendInfo=null; }
 function deleteSelected(){
   if(groupSel){ const before=current.items.map(cloneItem); current.items=current.items.filter(it=>groupSel.items.indexOf(it)<0);   // drop the lifted pieces; the hole stays
-    markDirty(current); pushHist({type:"items",node:current,before,after:current.items.map(cloneItem)}); groupSel=null; dirty=true; return; }
+    markDirty(current); pushHist({type:"items",node:current,before,after:current.items.map(cloneItem),removedFrames:detachEmptyFrames()}); groupSel=null; dirty=true; return; }
   if(!selected) return;
   if(selected.kind==="flownode"){                                           // cascade: drop the node's own connectors too, atomically, so undo restores both together
     const before=current.items.map(cloneItem), fid=selected.fid;
     current.items=current.items.filter(it=>it!==selected&&!(it.kind==="connector"&&(it.fromId===fid||it.toId===fid)));
-    markDirty(current); pushHist({type:"items",node:current,before,after:current.items.map(cloneItem)}); selected=null; dirty=true; return;
+    markDirty(current); pushHist({type:"items",node:current,before,after:current.items.map(cloneItem),removedFrames:detachEmptyFrames()}); selected=null; dirty=true; return;
   }
-  const i=current.items.indexOf(selected); if(i>=0){ current.items.splice(i,1); pushHist({type:"erase",node:current,removed:[{item:selected,i}]}); markDirty(current); } selected=null; dirty=true; }
+  const i=current.items.indexOf(selected); if(i>=0){ current.items.splice(i,1); markDirty(current); pushHist({type:"erase",node:current,removed:[{item:selected,i}],removedFrames:detachEmptyFrames()}); } selected=null; dirty=true; }
 
 /* ---------------- region cut (Photoshop-style lift) ----------------
    Draw a rectangle / ellipse / lasso; the content inside is lifted into a floating VECTOR
@@ -1864,9 +1877,10 @@ function beginEditText(it,isNew,before){
 function finishTextEdit(){
   if(!editingText) return; const it=editingText; editingText=null; textEdit.hidden=true;
   it.text=textEdit.value; it._w=null; it._cache=null;
-  if(it.kind==="text"&&!it.text.trim()){ const idx=current.items.indexOf(it); if(idx>=0) current.items.splice(idx,1); }   // empty label → drop it (a flownode keeps its box even unlabelled)
+  let dropped=false;
+  if(it.kind==="text"&&!it.text.trim()){ const idx=current.items.indexOf(it); if(idx>=0){ current.items.splice(idx,1); dropped=true; } }   // empty label → drop it (a flownode keeps its box even unlabelled)
   markDirty(current); const after=current.items.map(cloneItem);
-  if(JSON.stringify(after)!==JSON.stringify(textBefore||[])) pushHist({type:"items",node:current,before:textBefore||[],after});
+  if(JSON.stringify(after)!==JSON.stringify(textBefore||[])) pushHist({type:"items",node:current,before:textBefore||[],after,removedFrames:dropped?detachEmptyFrames():undefined});
   textBefore=null; selected=current.items.indexOf(it)>=0?it:null; dirty=true; scheduleSave(); }
 function textToolTap(p){
   for(let i=current.items.length-1;i>=0;i--){ const it=current.items[i]; const L=layerOf(it); if(L&&(!L.visible||L.locked)) continue; if(it.kind==="text"&&hitItem(it,p.x,p.y,6)){ beginEditText(it,false); return; } }
@@ -2894,7 +2908,7 @@ lpOpacity.oninput=()=>{ const L=curLayer(); if(!L) return; L.opacity=(+lpOpacity
 function snapshotLayerState(){ return {layers:cloneLayers(),active:gActive,items:allNodes().map(n=>({node:n,items:n.items.map(cloneItem)}))}; }
 function restoreLayerState(s){ gLayers=s.layers.map(L=>({...L})); gActive=s.active;
   for(const e of s.items){ e.node.items=e.items.map(cloneItem); e.node.dirty=true; e.node.bbox=undefined; } dirty=true; }
-function pushLayerHist(before){ pushHist({type:"layers",before,after:snapshotLayerState()}); }
+function pushLayerHist(before,removedFrames){ pushHist({type:"layers",before,after:snapshotLayerState(),removedFrames}); }
 
 document.getElementById("lpAdd").onclick=()=>{ const L=makeLayer("Layer "+(gLayers.length+1)); const ai=layerIndex(gActive);
   gLayers.splice(ai+1,0,L); gActive=L.id; scheduleSave(); renderLayers(); };
@@ -2916,7 +2930,7 @@ document.getElementById("lpDel").onclick=()=>{ if(gLayers.length<=1){ hintFlash(
   const before=snapshotLayerState(); const L=curLayer(), idx=layerIndex(L.id);
   for(const n of allNodes()) n.items=n.items.filter(it=>it.lyr!==L.id);   // drop the layer's items in every frame
   gLayers.splice(idx,1); gActive=gLayers[Math.max(0,idx-1)].id; selected=null; groupSel=null;
-  markAllDirty(); pushLayerHist(before); renderLayers(); };
+  markAllDirty(); pushLayerHist(before,detachEmptyFrames()); renderLayers(); };
 
 /* Drag the panel header to move the whole window. */
 let lpDrag=null;
